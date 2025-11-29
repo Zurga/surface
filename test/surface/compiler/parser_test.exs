@@ -1,5 +1,5 @@
 defmodule Surface.Compiler.ParserTest do
-  use ExUnit.Case, async: true
+  use Surface.Case, async: true
 
   import Surface.Compiler.Parser
   alias Surface.Compiler.ParseError
@@ -84,10 +84,10 @@ defmodule Surface.Compiler.ParserTest do
     assert [
              {
                "div",
-               '',
+               ~c"",
                [
                  "\n  ",
-                 {"span", '', '', %{line: 2, file: "nofile", column: 4}},
+                 {"span", ~c"", ~c"", %{line: 2, file: "nofile", column: 4}},
                  " ",
                  {"span", [], [], %{line: 2, file: "nofile", column: 12}},
                  "\n  ",
@@ -236,14 +236,14 @@ defmodule Surface.Compiler.ParserTest do
 
     test "with root node" do
       assert [
-               {"foo", '', [{:expr, "baz", %{line: 1, file: "nofile", column: 7}}],
+               {"foo", ~c"", [{:expr, "baz", %{line: 1, file: "nofile", column: 7}}],
                 %{line: 1, file: "nofile", column: 2}}
              ] = parse!("<foo>{baz}</foo>")
     end
 
     test "mixed curly bracket" do
       assert [
-               {"foo", '',
+               {"foo", ~c"",
                 [
                   "bar",
                   {:expr, "baz", %{line: 1, file: "nofile", column: 10}},
@@ -303,7 +303,7 @@ defmodule Surface.Compiler.ParserTest do
 
     test "self-closing macro" do
       assert parse!("<#Macro/>") ==
-               [{"#Macro", '', [], %{line: 1, file: "nofile", column: 2}}]
+               [{"#Macro", ~c"", [], %{line: 1, file: "nofile", column: 2}}]
     end
 
     test "keep track of the line of the definition" do
@@ -702,7 +702,7 @@ defmodule Surface.Compiler.ParserTest do
       <li
         {=id}
         {=@class}
-        {=@phx_capture_click}
+        {=@phx_click_away}
       />
       """
 
@@ -711,7 +711,7 @@ defmodule Surface.Compiler.ParserTest do
       assert [
                {"id", {:attribute_expr, "id", %{column: 5, line: 2}}, %{column: 4, line: 2}},
                {"class", {:attribute_expr, "@class", %{column: 5, line: 3}}, %{column: 4, line: 3}},
-               {"phx-capture-click", {:attribute_expr, "@phx_capture_click", %{column: 5, line: 4}},
+               {"phx-click-away", {:attribute_expr, "@phx_click_away", %{column: 5, line: 4}},
                 %{column: 4, line: 4}}
              ] = attributes
     end
@@ -721,7 +721,7 @@ defmodule Surface.Compiler.ParserTest do
       <Component
         {=id}
         {=@class}
-        {=@phx_capture_click}
+        {=@phx_click_away}
       />
       """
 
@@ -730,7 +730,7 @@ defmodule Surface.Compiler.ParserTest do
       assert [
                {"id", {:attribute_expr, "id", %{column: 5, line: 2}}, %{column: 4, line: 2}},
                {"class", {:attribute_expr, "@class", %{column: 5, line: 3}}, %{column: 4, line: 3}},
-               {"phx_capture_click", {:attribute_expr, "@phx_capture_click", %{column: 5, line: 4}},
+               {"phx_click_away", {:attribute_expr, "@phx_click_away", %{column: 5, line: 4}},
                 %{column: 4, line: 4}}
              ] = attributes
     end
@@ -742,13 +742,14 @@ defmodule Surface.Compiler.ParserTest do
       />
       """
 
-      message = """
-      nofile:2: invalid value for tagged expression `{=1}`. The expression must be either an assign or a variable.
+      message = ~r"""
+      nofile:2:
+      #{maybe_ansi("error:")} invalid value for tagged expression `{=1}`. The expression must be either an assign or a variable.
 
       Examples: `<div {=@class}>` or `<div {=class}>`
       """
 
-      assert_raise CompileError, message, fn -> parse!(code) end
+      assert_raise Surface.CompileError, message, fn -> parse!(code) end
     end
 
     test "raise on assigning {= ...} to an attribute" do
@@ -758,14 +759,15 @@ defmodule Surface.Compiler.ParserTest do
       />
       """
 
-      message = """
-      nofile:2: cannot assign `{=@class}` to attribute `class`. \
+      message = ~r"""
+      nofile:2:
+      #{maybe_ansi("error:")} cannot assign `{=@class}` to attribute `class`. \
       The tagged expression `{= }` can only be used on a root attribute/property.
 
       Example: <div {=@class}>
       """
 
-      assert_raise CompileError, message, fn -> parse!(code) end
+      assert_raise Surface.CompileError, message, fn -> parse!(code) end
     end
   end
 
@@ -995,9 +997,9 @@ defmodule Surface.Compiler.ParserTest do
       {/if}
       """
 
-      message = "nofile:2: missing expression for block {#if ...}"
+      message = ~r"nofile:2:\n#{maybe_ansi("error:")} missing expression for block {#if ...}"
 
-      assert_raise CompileError, message, fn -> parse!(code) end
+      assert_raise Surface.CompileError, message, fn -> parse!(code) end
 
       code = """
       1
@@ -1006,9 +1008,9 @@ defmodule Surface.Compiler.ParserTest do
       {/case}
       """
 
-      message = "nofile:2: missing expression for block {#case ...}"
+      message = ~r"nofile:2:\n#{maybe_ansi("error:")} missing expression for block {#case ...}"
 
-      assert_raise CompileError, message, fn -> parse!(code) end
+      assert_raise Surface.CompileError, message, fn -> parse!(code) end
     end
 
     test "raise error on missing closing block" do
@@ -1046,7 +1048,7 @@ defmodule Surface.Compiler.ParserSyncTest do
     assert message =~ """
            Using unquoted attribute values is not recommended as they will always be converted to strings.
 
-           For intance, `selected=true` and `tabindex=3` will be translated to `selected="true"` and `tabindex="3"` respectively.
+           For instance, `selected=true` and `tabindex=3` will be translated to `selected="true"` and `tabindex="3"` respectively.
 
            Hint: if you want to pass a literal boolean or integer, replace `prop1=1` with `prop1={1}`
            """
@@ -1067,7 +1069,7 @@ defmodule Surface.Compiler.ParserSyncTest do
     assert message =~ """
            Using unquoted attribute values is not recommended as they will always be converted to strings.
 
-           For intance, `selected=true` and `tabindex=3` will be translated to `selected="true"` and `tabindex="3"` respectively.
+           For instance, `selected=true` and `tabindex=3` will be translated to `selected="true"` and `tabindex="3"` respectively.
 
            Hint: if you want to pass a literal boolean or integer, replace `prop1=true` with `prop1={true}`
            """
@@ -1075,7 +1077,7 @@ defmodule Surface.Compiler.ParserSyncTest do
     assert message =~ """
            Using unquoted attribute values is not recommended as they will always be converted to strings.
 
-           For intance, `selected=true` and `tabindex=3` will be translated to `selected="true"` and `tabindex="3"` respectively.
+           For instance, `selected=true` and `tabindex=3` will be translated to `selected="true"` and `tabindex="3"` respectively.
 
            Hint: if you want to pass a literal boolean or integer, replace `prop2=false` with `prop2={false}`
            """

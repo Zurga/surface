@@ -18,10 +18,10 @@ defmodule Surface.Catalogue do
       of each example or playground.
 
     * `example` - A keyword list of options to be applied for all examples
-      in in the catalogue.
+      in the catalogue.
 
     * `playground` - A keyword list of options to be applied for all playgrounds
-      in in the catalogue.
+      in the catalogue.
 
   """
   @callback config :: keyword()
@@ -69,7 +69,11 @@ defmodule Surface.Catalogue do
   def get_metadata(module) do
     case Code.fetch_docs(module) do
       {:docs_v1, _, _, "text/markdown", docs, %{catalogue: meta}, _} ->
-        doc = Map.get(docs, "en")
+        doc =
+          if :hidden == docs,
+            do: "",
+            else: Map.get(docs, "en")
+
         meta |> Map.new() |> Map.put(:doc, doc)
 
       _ ->
@@ -80,12 +84,14 @@ defmodule Surface.Catalogue do
   @doc false
   def get_config(module) do
     meta = get_metadata(module)
+    project_config = Application.get_env(:surface_catalogue, :assets_config, [])
     user_config = Map.get(meta, :config, [])
     catalogue = Keyword.get(user_config, :catalogue)
     catalogue_config = get_catalogue_config(catalogue)
     {type_config, catalogue_config} = Keyword.split(catalogue_config, [:example, :playground])
 
     @default_config
+    |> Keyword.merge(project_config)
     |> Keyword.merge(catalogue_config)
     |> Keyword.merge(type_config[meta.type] || [])
     |> Keyword.merge(user_config)
@@ -98,15 +104,15 @@ defmodule Surface.Catalogue do
         subject
 
       _ ->
-        message = """
-        no subject defined for #{inspect(type)}
+        message = "no subject defined for #{inspect(type)}"
 
-        Hint: You can define the subject using the :subject option. Example:
+        hint = """
+        you can define the subject using the :subject option. Example:
 
           use #{inspect(type)}, subject: MyApp.MyButton
         """
 
-        Surface.IOHelper.compile_error(message, caller.file, caller.line)
+        Surface.IOHelper.compile_error(message, hint, caller.file, caller.line)
     end
   end
 

@@ -1,6 +1,8 @@
 defmodule Surface.DirectivesTest do
   use Surface.ConnCase, async: true
 
+  alias Phoenix.LiveView.JS
+
   defmodule Div do
     use Surface.Component
 
@@ -46,11 +48,11 @@ defmodule Surface.DirectivesTest do
     use Surface.Component
 
     prop show, :boolean
-    slot default, args: [:data]
+    slot default, arg: %{data: :string}
 
     def render(assigns) do
       ~F"""
-      <div><#slot :if={@show} :args={data: "data"}/></div>
+      <div><#slot :if={@show} {@default, data: "data"}/></div>
       """
     end
   end
@@ -138,6 +140,23 @@ defmodule Surface.DirectivesTest do
              """
     end
 
+    test "using assign, static props override dynamic props" do
+      assigns = %{props: %{class: "text-xs", hidden: true, content: "dynamic props content"}}
+
+      html =
+        render_surface do
+          ~F"""
+          <DivWithProps content="static content" :props={@props} />
+          """
+        end
+
+      assert html =~ """
+             <div class="text-xs hidden">
+               static content
+             </div>
+             """
+    end
+
     test "shorthand notation `{...@props}`" do
       assigns = %{props: %{class: "text-xs", hidden: false, content: "dynamic props content"}}
 
@@ -167,14 +186,15 @@ defmodule Surface.DirectivesTest do
           """
         end
 
-      message = """
-      code:3: cannot assign `{...@props}` to attribute `class`. \
-      The tagged expression `{... }` can only be used on a root attribute/property.
+      message = ~r"""
+      code:3:
+      #{maybe_ansi("error:")} cannot assign `{\.\.\.@props}` to attribute `class`\. \
+      The tagged expression `{\.\.\. }` can only be used on a root attribute/property\.
 
-      Example: <div {...@attrs}>
+      Example: <div {\.\.\.@attrs}>
       """
 
-      assert_raise(CompileError, message, fn ->
+      assert_raise(Surface.CompileError, message, fn ->
         compile_surface(code, assigns)
       end)
     end
@@ -227,11 +247,11 @@ defmodule Surface.DirectivesTest do
           """
         end
 
-      assert html =~ """
-             <div aria-label="A div" id="myid" class="myclass">
-               Some Text
-             </div>
-             """
+      doc = parse_document!(html)
+
+      assert attribute(doc, "id") == ["myid"]
+      assert attribute(doc, "aria-label") == ["A div"]
+      assert attribute(doc, "class") == ["myclass"]
     end
 
     test "with boolean properties" do
@@ -278,7 +298,10 @@ defmodule Surface.DirectivesTest do
           """
         end
 
-      assert html =~ ~s(<div class="text-xs" style="color: black;"></div>)
+      doc = parse_document!(html)
+
+      assert attribute(doc, "class") == ["text-xs"]
+      assert attribute(doc, "style") == ["color: black;"]
     end
 
     test "raise if trying to assisn `{... }` to an attribute" do
@@ -293,14 +316,15 @@ defmodule Surface.DirectivesTest do
           """
         end
 
-      message = """
-      code:3: cannot assign `{...@attrs}` to attribute `class`. \
-      The tagged expression `{... }` can only be used on a root attribute/property.
+      message = ~r"""
+      code:3:
+      #{maybe_ansi("error:")} cannot assign `{\.\.\.@attrs}` to attribute `class`\. \
+      The tagged expression `{\.\.\. }` can only be used on a root attribute/property\.
 
-      Example: <div {...@attrs}>
+      Example: <div {\.\.\.@attrs}>
       """
 
-      assert_raise(CompileError, message, fn ->
+      assert_raise(Surface.CompileError, message, fn ->
         compile_surface(code, assigns)
       end)
     end
@@ -363,11 +387,12 @@ defmodule Surface.DirectivesTest do
           """
         end
 
-      message = """
-      code:2: unknown modifier "unknown" for directive :for\
+      message = ~r"""
+      code:2:
+      #{maybe_ansi("error:")} unknown modifier "unknown" for directive :for\
       """
 
-      assert_raise(CompileError, message, fn ->
+      assert_raise(Surface.CompileError, message, fn ->
         compile_surface(code, assigns)
       end)
     end
@@ -385,11 +410,12 @@ defmodule Surface.DirectivesTest do
           """
         end
 
-      message = """
-      code:2: cannot apply modifier "with_index" on generators with multiple clauses\
+      message = ~r"""
+      code:2:
+      #{maybe_ansi("error:")} cannot apply modifier "with_index" on generators with multiple clauses\
       """
 
-      assert_raise(CompileError, message, fn ->
+      assert_raise(Surface.CompileError, message, fn ->
         compile_surface(code, assigns)
       end)
     end
@@ -673,10 +699,12 @@ defmodule Surface.DirectivesTest do
           ~F"""
           <col :show={@show}>
           <col :show={true}>
+          <col :show>
           """
         end
 
       assert html == """
+             <col>
              <col>
              <col>
              """
@@ -722,9 +750,9 @@ defmodule Surface.DirectivesTest do
           """
         end
 
-      assert html =~ """
-             <button phx-click="ok" phx-target="#comp">OK</button>
-             """
+      doc = parse_document!(html)
+
+      assert js_attribute(doc, "phx-click") == [["push", %{"event" => "ok", "target" => "#comp"}]]
     end
 
     test "as a string" do
@@ -763,8 +791,146 @@ defmodule Surface.DirectivesTest do
           """
         end
 
+      doc = parse_document!(html)
+
+      assert js_attribute(doc, "phx-click") == [["push", %{"event" => "ok", "target" => "#comp"}]]
+    end
+
+    test "as %JS{} struct without target" do
+      html =
+        render_surface do
+          ~F"""
+          <button :on-click={JS.push("ok")}>OK</button>
+          """
+        end
+
+      doc = parse_document!(html)
+
+      assert js_attribute(doc, "phx-click") == [["push", %{"event" => "ok"}]]
+    end
+
+    test "as %JS{} struct with target" do
+      html =
+        render_surface do
+          ~F"""
+          <button :on-click={JS.push("ok", target: "#comp")}>OK</button>
+          """
+        end
+
+      doc = parse_document!(html)
+
+      assert js_attribute(doc, "phx-click") == [["push", %{"event" => "ok", "target" => "#comp"}]]
+    end
+
+    test "as %JS{} struct with target as :live_view" do
+      html =
+        render_surface do
+          ~F"""
+          <button :on-click={JS.push("ok", target: :live_view)}>OK</button>
+          """
+        end
+
+      doc = parse_document!(html)
+
+      assert js_attribute(doc, "phx-click") == [["push", %{"event" => "ok"}]]
+    end
+
+    defmodule LiveComponentUsingOnEvent do
+      use Surface.LiveComponent
+
+      def render(assigns), do: ~F[<button :on-click={JS.push("ok")}>OK</button>]
+    end
+
+    test "set the target of the %JS{} to @myself if it's a live_component and there's no target set yet" do
+      html =
+        render_surface do
+          ~F"""
+          <LiveComponentUsingOnEvent id="123"/>
+          """
+        end
+
+      doc = parse_document!(html)
+
+      assert js_attribute(doc, "phx-click") == [["push", %{"event" => "ok", "target" => 1}]]
+    end
+
+    defmodule LiveComponentUsingOnEventWithTarget do
+      use Surface.LiveComponent
+
+      def render(assigns), do: ~F[<button :on-click={JS.push("ok", target: "#comp")}>OK</button>]
+    end
+
+    test "don't set the target of the %JS{} if it's a live_component but there's already a target set" do
+      html =
+        render_surface do
+          ~F"""
+          <LiveComponentUsingOnEventWithTarget id="123"/>
+          """
+        end
+
+      doc = parse_document!(html)
+
+      assert js_attribute(doc, "phx-click") == [["push", %{"event" => "ok", "target" => "#comp"}]]
+    end
+
+    defmodule FunctionComponentUsingOnEventInLivecomponent do
+      use Surface.LiveComponent
+
+      def render(assigns), do: ~F[<div><.func/></div>]
+      def func(assigns), do: ~F[<button :on-click={JS.push("ok")}>OK</button>]
+    end
+
+    test "as %JS{} struct on a function component without target in a live component" do
+      html =
+        render_surface do
+          ~F"""
+          <FunctionComponentUsingOnEventInLivecomponent id="123"/>
+          """
+        end
+
+      doc = parse_document!(html)
+
+      assert js_attribute(doc, "div > button", "phx-click") == [["push", %{"event" => "ok"}]]
+    end
+
+    test "translate available events" do
+      html =
+        render_surface do
+          ~F"""
+          <div :on-click="event">click</div>
+          <div :on-click-away="event">click-away</div>
+          <div :on-capture-click="event">capture-click</div>
+          <div :on-change="event">change</div>
+          <div :on-submit="event">submit</div>
+          <div :on-blur="event">blur</div>
+          <div :on-focus="event">focus</div>
+          <div :on-window-blur="event">window-blur</div>
+          <div :on-window-focus="event">window-focus</div>
+          <div :on-keydown="event">keydown</div>
+          <div :on-keyup="event">keyup</div>
+          <div :on-window-keydown="event">window-keydown</div>
+          <div :on-window-keyup="event">window-keyup</div>
+          <div :on-viewport-top="event">viewport-top</div>
+          <div :on-viewport-bottom="event">viewport-bottom</div>
+          """
+        end
+
       assert html =~ """
-             <button phx-click="ok" phx-target="#comp">OK</button>
+             <div phx-click="event">click</div>
+             <div phx-click-away="event">click-away</div>
+             <div phx-capture-click="event">capture-click</div>
+             <div phx-change="event">change</div>
+             <div phx-submit="event">submit</div>
+             <div phx-blur="event">blur</div>
+             <div phx-focus="event">focus</div>
+             <div phx-window-blur="event">window-blur</div>
+             <div phx-window-focus="event">window-focus</div>
+             <div phx-keydown="event">keydown</div>
+             <div phx-keyup="event">keyup</div>
+             <div phx-window-keydown="event">window-keydown</div>
+             <div phx-window-keyup="event">window-keyup</div>
+             <div phx-viewport-top="event">viewport-top</div>
+             <div phx-viewport-bottom="event">viewport-bottom</div>
              """
     end
 
@@ -783,6 +949,19 @@ defmodule Surface.DirectivesTest do
   end
 
   describe ":hook" do
+    test "generate a default phx-hook with __MODULE__ as default namespace" do
+      html =
+        render_surface do
+          ~F"""
+          <div :hook></div>
+          """
+        end
+
+      assert html =~ """
+             <div phx-hook="Surface.DirectivesTest#default"></div>
+             """
+    end
+
     test "generate phx-hook with __MODULE__ as default namespace" do
       html =
         render_surface do
@@ -924,11 +1103,12 @@ defmodule Surface.DirectivesTest do
           """
         end
 
-      assert html =~ """
-             <div phx-value-foo="bar" phx-value-hello="world" phx-value-one="2" phx-value-yes="true">
-               Some Text
-             </div>
-             """
+      doc = parse_document!(html)
+
+      assert attribute(doc, "phx-value-foo") == ["bar"]
+      assert attribute(doc, "phx-value-hello") == ["world"]
+      assert attribute(doc, "phx-value-one") == ["2"]
+      assert attribute(doc, "phx-value-yes") == ["true"]
     end
 
     test "passing a map" do
@@ -941,15 +1121,16 @@ defmodule Surface.DirectivesTest do
           """
         end
 
-      assert html =~ """
-             <div phx-value-foo="bar" phx-value-hello="world" phx-value-one="2" phx-value-yes="true">
-               Some Text
-             </div>
-             """
+      doc = parse_document!(html)
+
+      assert attribute(doc, "phx-value-hello") == ["world"]
+      assert attribute(doc, "phx-value-foo") == ["bar"]
+      assert attribute(doc, "phx-value-one") == ["2"]
+      assert attribute(doc, "phx-value-yes") == ["true"]
     end
 
     test "passing unsupported types" do
-      assert_raise(CompileError, ~r(invalid value for key ":map" in attribute ":values".), fn ->
+      assert_raise(Surface.CompileError, ~r(invalid value for key ":map" in attribute ":values".), fn ->
         """
         <div :values={map: %{}, tuple: {}}>
           Some Text
@@ -972,11 +1153,12 @@ defmodule Surface.DirectivesTest do
           """
         end
 
-      assert html =~ """
-             <div phx-value-foo="bar" phx-value-hello="world" phx-value-one="2" phx-value-yes="true">
-               Some Text
-             </div>
-             """
+      doc = parse_document!(html)
+
+      assert attribute(doc, "phx-value-hello") == ["world"]
+      assert attribute(doc, "phx-value-foo") == ["bar"]
+      assert attribute(doc, "phx-value-one") == ["2"]
+      assert attribute(doc, "phx-value-yes") == ["true"]
     end
 
     test "static properties override dynamic properties" do
@@ -1028,36 +1210,30 @@ defmodule Surface.DirectivesTest do
       assert html == "\n"
     end
   end
-end
 
-defmodule Surface.DirectivesSyncTest do
-  use Surface.ConnCase
+  test "on live components" do
+    code = ~S'''
+    defmodule Surface.DirectivesTest.OnLiveComponents do
+      use Elixir.Surface.LiveComponent
 
-  import ExUnit.CaptureIO
-
-  alias Surface.DirectivesTest.{DivWithProps}
-
-  describe ":props on a component" do
-    test "emits a warning with an unknown prop at runtime" do
-      assigns = %{
-        opts: %{
-          unknown: "value",
-          class: "text-xs",
-          hidden: false,
-          content: "dynamic props content"
-        }
-      }
-
-      message =
-        capture_io(:standard_error, fn ->
-          render_surface do
-            ~F"""
-            <DivWithProps :props={@opts} />
-            """
-          end
-        end)
-
-      assert message =~ ~S|Unknown property "unknown" for component <DivWithProps>|
+      def render(assigns) do
+        ~F"""
+        <div>
+          <div
+            :attrs={a: 1}
+            :on-click="fake"
+            :show={false}
+            :hook="fake"
+            :values={a: 1}
+            :if={true}
+            :for={_i <- [1]}>
+          </div>
+        </div>
+        """
+      end
     end
+    '''
+
+    assert {{:module, _, _, _}, _} = Code.eval_string(code, [], %{__ENV__ | file: "code.exs", line: 1})
   end
 end

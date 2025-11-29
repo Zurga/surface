@@ -1,6 +1,8 @@
 defmodule Surface.Components.Dynamic.ComponentTest do
   use Surface.ConnCase, async: true
+
   import Phoenix.ConnTest
+  import ExUnit.CaptureIO
 
   defmodule Stateless do
     use Surface.Component
@@ -12,6 +14,30 @@ defmodule Surface.Components.Dynamic.ComponentTest do
       ~F"""
       <div class={@class}>
         <span>{@label}</span>
+      </div>
+      """
+    end
+  end
+
+  defmodule ComponentWithEvent do
+    use Surface.Component
+
+    prop click, :event
+
+    def render(assigns) do
+      ~F"""
+      <div :on-click={@click}/>
+      """
+    end
+  end
+
+  defmodule PhoenixFunctionComponent do
+    use Phoenix.Component
+
+    def show(assigns) do
+      ~H"""
+      <div class={@class}>
+        <span><%= @label %></span>
       </div>
       """
     end
@@ -39,16 +65,16 @@ defmodule Surface.Components.Dynamic.ComponentTest do
     end
   end
 
-  defmodule OuterWithSlotArgs do
+  defmodule OuterWithSlotArg do
     use Surface.Component
 
-    slot default, args: [:info]
+    slot default, arg: %{info: :string}
 
     def render(assigns) do
       info = "My info"
 
       ~F"""
-      <div><#slot :args={info: info}/></div>
+      <div><#slot {@default, info: info}/></div>
       """
     end
   end
@@ -57,10 +83,18 @@ defmodule Surface.Components.Dynamic.ComponentTest do
     use Surface.LiveView
 
     def render(assigns) do
-      module = Stateless
-
       ~F"""
-      <Component module={module} label="My label" class="myclass"/>
+      <Component module={Stateless} label="My label" class="myclass"/>
+      """
+    end
+  end
+
+  defmodule ViewWithPhoenixFunctionComponent do
+    use Surface.LiveView
+
+    def render(assigns) do
+      ~F"""
+      <Component module={PhoenixFunctionComponent} function={:show} label="My label" class="myclass"/>
       """
     end
   end
@@ -77,12 +111,12 @@ defmodule Surface.Components.Dynamic.ComponentTest do
     end
   end
 
-  defmodule ViewWithSlotArgs do
+  defmodule ViewWithSlotArg do
     use Surface.LiveView
 
     def render(assigns) do
       ~F"""
-      <Component module={OuterWithSlotArgs} :let={info: my_info}>
+      <Component module={OuterWithSlotArg} :let={info: my_info}>
         {my_info}
       </Component>
       """
@@ -125,10 +159,8 @@ defmodule Surface.Components.Dynamic.ComponentTest do
     use Surface.LiveView
 
     def render(assigns) do
-      module = StatelessWithId
-
       ~F"""
-      <Component module={module} id="my_id" />
+      <Component module={StatelessWithId} id="my_id" />
       """
     end
   end
@@ -178,13 +210,21 @@ defmodule Surface.Components.Dynamic.ComponentTest do
              """
     end
 
-    test "render content with slot args" do
-      {:ok, _view, html} = live_isolated(build_conn(), ViewWithSlotArgs)
+    test "render content with slot arg" do
+      {:ok, _view, html} = live_isolated(build_conn(), ViewWithSlotArg)
 
       assert html =~ """
              <div>
                My info
              </div>\
+             """
+    end
+
+    test "render phoenix function component" do
+      {:ok, _view, html} = live_isolated(build_conn(), ViewWithPhoenixFunctionComponent)
+
+      assert html =~ """
+             <div class="myclass"><span>My label</span></div>\
              """
     end
   end
@@ -224,11 +264,11 @@ defmodule Surface.Components.Dynamic.ComponentTest do
              """
     end
 
-    test "render content with slot args" do
+    test "render content with slot arg" do
       html =
         render_surface do
           ~F"""
-          <Component module={OuterWithSlotArgs} :let={info: my_info}>
+          <Component module={OuterWithSlotArg} :let={info: my_info}>
             {my_info}
           </Component>
           """
@@ -241,40 +281,139 @@ defmodule Surface.Components.Dynamic.ComponentTest do
              """
     end
 
-    test "render error message if module is not a component", %{conn: conn} do
-      import ExUnit.CaptureIO
+    register_propagate_context_to_slots([__MODULE__.ContextComp])
 
-      code =
-        quote do
+    defmodule ContextComp do
+      use Surface.Component
+
+      slot default
+
+      data form, :form
+
+      def render(assigns) do
+        assigns = Context.copy_assign(assigns, :form)
+
+        ~F"""
+        <Context put={field: "#{@form} + field"}>
+          <#slot/>
+        </Context>
+        """
+      end
+    end
+
+    test "context propagation" do
+      alias Surface.Components.Context
+
+      html =
+        render_surface do
           ~F"""
-          <div>
-            <Enum/>
-          </div>
+          <Context put={form: :fake_form}>
+            <Component module={ContextComp}>
+              <Context get={field: field}>
+                {field}
+              </Context>
+            </Component>
+          </Context>
           """
         end
 
+      assert html =~ "fake_form + field"
+    end
+
+    test "render plain old phoenix function component" do
+      html =
+        render_surface do
+          ~F"""
+          <Component module={PhoenixFunctionComponent} function={:show} label="My label" class="myclass"/>
+          """
+        end
+
+      assert html =~ """
+             <div class="myclass">
+               <span>My label</span>
+             </div>
+             """
+    end
+
+    test "renders the last attribute when passing multiple that don't accumulate, and warns" do
       output =
         capture_io(:standard_error, fn ->
-          module = compile_surface(code)
-          {:ok, _view, html} = live_isolated(conn, module)
+          html =
+            render_surface do
+              ~F"""
+              <Component module={Stateless} label="My label 1" label="My label 2" />
+              """
+            end
 
           assert html =~ """
-                 <div><span style="color: red; border: 2px solid red; padding: 3px"> \
-                 Error: cannot render &lt;Enum&gt; (module Enum is not a component)\
-                 </span></div>\
+                 <div>
+                   <span>My label 2</span>
+                 </div>
                  """
         end)
 
-      assert output =~ ~r"""
-             cannot render <Enum> \(module Enum is not a component\)
-               code:2:\
+      assert output =~ """
+             the prop `label` has been passed multiple times. Considering only the last value.
+
+             Hint: Either remove all redundant definitions or set option `accumulate` to `true`:
+
+             ```
+               prop label, :string, accumulate: true
+             ```
+
+             This way the values will be accumulated in a list.
              """
+    end
+
+    test "renders the last attribute when passing multiple that don't accumulate, with assign" do
+      assigns = %{label1: "My label 1", label2: "My label 2"}
+
+      output =
+        capture_io(:standard_error, fn ->
+          html =
+            render_surface do
+              ~F"""
+              <Component module={Stateless} label={@label1} label={@label2} />
+              """
+            end
+
+          assert html =~ """
+                 <div>
+                   <span>My label 2</span>
+                 </div>
+                 """
+        end)
+
+      assert output =~ """
+             the prop `label` has been passed multiple times. Considering only the last value.
+
+             Hint: Either remove all redundant definitions or set option `accumulate` to `true`:
+
+             ```
+               prop label, :string, accumulate: true
+             ```
+
+             This way the values will be accumulated in a list.
+             """
+    end
+
+    test "attribute values are still converted according to their types but only at runtime" do
+      html =
+        render_surface do
+          ~F"""
+          <Component module={ComponentWithEvent} click={"ok", target: "#comp"}/>
+          """
+        end
+
+      doc = parse_document!(html)
+
+      assert js_attribute(doc, "phx-click") == [["push", %{"event" => "ok", "target" => "#comp"}]]
     end
   end
 
   describe "dynamic components in dead views" do
     defmodule DeadView do
-      use Phoenix.View, root: "support/dead_views"
+      use Phoenix.Template, root: "support/dead_views"
       import Surface
       alias Surface.Components.Dynamic.Component
 
@@ -286,7 +425,7 @@ defmodule Surface.Components.Dynamic.ComponentTest do
     end
 
     test "renders dynamic components" do
-      assert Phoenix.View.render_to_string(DeadView, "index.html", []) =~
+      assert Phoenix.Template.render_to_string(DeadView, "index", "html", []) =~
                """
                <div><div class="myclass">
                  <span>My label</span>

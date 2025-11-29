@@ -28,15 +28,16 @@ defmodule Surface.Catalogue.PlaygroundTest do
     end
     """
 
-    message = """
-    code.exs:2: no subject defined for Surface.Catalogue.Playground
+    message = ~r"""
+    code.exs:2:
+    #{maybe_ansi("error:")} no subject defined for Surface.Catalogue.Playground
 
-    Hint: You can define the subject using the :subject option. Example:
+    #{maybe_ansi("hint:")} you can define the subject using the :subject option. Example:
 
       use Surface.Catalogue.Playground, subject: MyApp.MyButton
     """
 
-    assert_raise CompileError, message, fn ->
+    assert_raise Surface.CompileError, message, fn ->
       Code.eval_string(code, [], %{__ENV__ | file: "code.exs", line: 1})
     end
   end
@@ -44,8 +45,15 @@ defmodule Surface.Catalogue.PlaygroundTest do
   test "merge default values with custom props" do
     {:ok, _view, html} = live_isolated(build_conn(), FakePlayground)
 
-    assert html =~ "color: white"
-    assert html =~ "label: My label"
-    assert html =~ "type: button"
+    assert html =~ html_escape(~S(color: "white"))
+    assert html =~ html_escape(~S(label: "My label"))
+    assert html =~ html_escape(~S(type: "button"))
+    assert html =~ html_escape(~S(map: %{info: "info"}))
+  end
+
+  defp html_escape(string) do
+    string
+    |> Phoenix.HTML.Engine.html_escape()
+    |> to_string()
   end
 end

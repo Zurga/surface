@@ -75,6 +75,11 @@ defmodule Surface.MacroComponentTest do
     end
   end
 
+  defmodule MissingExpand do
+    use Surface.Component
+    def render(assigns), do: ~F""
+  end
+
   test "empty content is translated to empty string" do
     assert render_surface(do: ~F[<#RenderContent />]) == ""
     assert render_surface(do: ~F[<#RenderContent></#RenderContent>]) == ""
@@ -121,7 +126,7 @@ defmodule Surface.MacroComponentTest do
 
     assert html =~ """
            <div>
-           <span title="Some title" disabled tabindex="1" id="123">
+           <span title="Some title" disabled tabindex="1" id="123" class="">
              CONTENT
            </span>
            </div>
@@ -180,7 +185,7 @@ defmodule Surface.MacroComponentTest do
         """
       end
 
-    assert_raise(SyntaxError, ~r/code:2: syntax error before: ','/, fn ->
+    assert_raise(SyntaxError, ~r/code:2:/, fn ->
       compile_surface(code)
     end)
   end
@@ -196,20 +201,93 @@ defmodule Surface.MacroComponentTest do
         """
       end
 
-    message = """
-    code:2: invalid value for property "align"
+    message = ~r"""
+    code:2:
+    #{maybe_ansi("error:")} invalid value for property "align"
 
     Expected a string while evaluating {@align}, got: nil
 
     Hint: static properties of macro components can only accept static values like module attributes,
     literals or compile-time expressions. Runtime variables and expressions, including component
-    assigns, cannot be evaluated as they are not available during compilation.
+    assigns, cannot be evaluated as they are not available during compilation\.
     """
 
-    assert_raise(CompileError, message, fn ->
+    assert_raise(Surface.CompileError, message, fn ->
       capture_io(:standard_error, fn ->
         compile_surface(code, %{class: "markdown"})
       end)
     end)
+  end
+
+  test "missing expand are not rendered" do
+    code =
+      quote do
+        ~F"""
+        <#MissingExpand />
+        """
+      end
+
+    output =
+      capture_io(:standard_error, fn ->
+        compile_surface(code)
+      end)
+
+    assert output =~ ~r"cannot render <#MissingExpand> \(MacroComponents must export an expand/3 function\)"
+  end
+
+  if Version.match?(System.version(), ">= 1.15.0") do
+    test "non existing is not rendered" do
+      code =
+        quote do
+          ~F"""
+          <#NonExisting />
+          """
+        end
+
+      diagnostics =
+        Code.with_diagnostics(fn ->
+          try do
+            compile_surface(code)
+          rescue
+            e -> e
+          end
+        end)
+
+      assert {%Surface.CompileError{
+                description: "cannot render <#NonExisting> (module NonExisting could not be loaded)",
+                hint: """
+                make sure module `NonExisting` can be successfully compiled.
+
+                If the module is namespaced, you can use its full name. For instance:
+
+                  <MyProject.Components.NonExisting>
+
+                or add a proper alias so you can use just `<NonExisting>`:
+
+                  alias MyProject.Components.NonExisting
+                """,
+                file: "code",
+                line: 1,
+                column: 2
+              }, []} = diagnostics
+    end
+  else
+    # Remove this test (and the `if`) whenever we drop support for Elixir < 1.15
+    test "non existing is not rendered" do
+      code =
+        quote do
+          ~F"""
+          <#NonExisting />
+          """
+        end
+
+      assert_raise(
+        Surface.CompileError,
+        ~r/code:1(:2)?:\n#{maybe_ansi("error:")} cannot render \<#NonExisting\> \(module NonExisting could not be loaded\)/,
+        fn ->
+          compile_surface(code)
+        end
+      )
+    end
   end
 end

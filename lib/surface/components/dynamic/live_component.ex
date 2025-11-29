@@ -18,8 +18,9 @@ defmodule Surface.Components.Dynamic.LiveComponent do
   """
   slot default
 
+  @doc false
   def transform(node) do
-    %AST.Component{props: props, directives: directives, templates: templates, meta: meta} = node
+    %AST.Component{props: props, directives: directives, slot_entries: slot_entries, meta: meta} = node
 
     {%{module: mod}, other_props} = AST.pop_attributes_values_as_map(props, [:module])
 
@@ -28,7 +29,7 @@ defmodule Surface.Components.Dynamic.LiveComponent do
       type: :dynamic_live,
       props: other_props,
       directives: directives,
-      templates: templates,
+      slot_entries: slot_entries,
       meta: meta
     }
   end

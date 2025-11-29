@@ -3,8 +3,18 @@ defmodule HtmlTagTest do
 
   @encoded_json "[{\"x\":10,\"y\":20}]"
 
+  alias Phoenix.LiveView.Rendered
+
+  defp eval(string, caller, assigns \\ %{}) do
+    string
+    |> Surface.Compiler.compile(1, caller)
+    |> Surface.Compiler.to_live_struct()
+    |> Code.eval_quoted(assigns: assigns)
+    |> elem(0)
+  end
+
   test "raise runtime error for invalid attributes values" do
-    assert_raise(CompileError, ~r/invalid value for attribute "title"/, fn ->
+    assert_raise(Surface.CompileError, ~r/invalid value for attribute "title"/, fn ->
       "<div title={{1, 2}}/>"
       |> Surface.Compiler.compile(1, __ENV__)
       |> Surface.Compiler.to_live_struct()
@@ -106,7 +116,7 @@ defmodule HtmlTagTest do
     end
   end
 
-  describe "basic attibutes" do
+  describe "basic attributes" do
     test "as literal string" do
       html =
         render_surface do
@@ -130,6 +140,19 @@ defmodule HtmlTagTest do
 
       assert html =~ """
              <div title="1 < 2"></div>
+             """
+    end
+
+    test "as expression with a literal string, encode HTML entities" do
+      html =
+        render_surface do
+          ~F"""
+          <div title={"> 123"}/>
+          """
+        end
+
+      assert html =~ """
+             <div title="&gt; 123"></div>
              """
     end
 
@@ -258,7 +281,7 @@ defmodule HtmlTagTest do
   end
 
   describe "css class attributes" do
-    test "as string" do
+    test "as string literal" do
       assigns = %{value1: true, value2: false, value3: true}
 
       html =
@@ -271,6 +294,22 @@ defmodule HtmlTagTest do
       assert html =~ """
              <div class="myclass"></div>
              """
+    end
+
+    test "as string literal, translate directly to static html, without encoding" do
+      %Rendered{static: static} = eval(~S{<div class="[&:nth-child(2)]:p-4"></div>}, __ENV__)
+
+      assert static == [~S{<div class="[&:nth-child(2)]:p-4"></div>}]
+    end
+
+    test "as expression with a literal string, translate and encode directly to static html" do
+      code = """
+      <div class={"[&:nth-child(2)]:p-4"}/>\
+      """
+
+      %Rendered{static: static} = eval(code, __ENV__)
+
+      assert static == [~S{<div class="[&amp;:nth-child(2)]:p-4"></div>}]
     end
 
     test "css class with keyword list notation" do
@@ -425,7 +464,7 @@ defmodule HtmlTagTest do
     end
 
     test "raise compile error for invalid style value that can be evaluated at compile time" do
-      assert_raise(CompileError, ~r/invalid value for attribute "style"/, fn ->
+      assert_raise(Surface.CompileError, ~r/invalid value for attribute "style"/, fn ->
         "<div style={{1, 2}}/>"
         |> Surface.Compiler.compile(1, __ENV__)
         |> Surface.Compiler.to_live_struct()

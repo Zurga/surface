@@ -95,10 +95,10 @@ defmodule Surface do
   You can visit the documentation of each type of component for further explanation and examples.
   """
 
-  alias Phoenix.LiveView
   alias Surface.API
   alias Surface.Compiler.Helpers
   alias Surface.IOHelper
+  alias Surface.TypeHandler
 
   @doc """
   Translates Surface code into Phoenix templates.
@@ -109,20 +109,76 @@ defmodule Surface do
     indentation = meta[:indentation] || 0
     column = meta[:column] || 1
 
-    caller_is_surface_component =
-      Module.open?(__CALLER__.module) &&
-        Module.get_attribute(__CALLER__.module, :component_type) != nil
+    component_type = Module.get_attribute(__CALLER__.module, :component_type)
 
     string
     |> Surface.Compiler.compile(line, __CALLER__, __CALLER__.file,
-      checks: [no_undefined_assigns: caller_is_surface_component],
+      checks: [no_undefined_assigns: component_type != nil],
       indentation: indentation,
       column: column
     )
     |> Surface.Compiler.to_live_struct(
       debug: Enum.member?(opts, ?d),
       file: __CALLER__.file,
-      line: line
+      line: line,
+      caller: __CALLER__,
+      annotate_content: annotate_content()
+    )
+  end
+
+  @doc """
+  Embeds an `.sface` template as a function component.
+
+  ## Example
+
+      defmodule MyAppWeb.Layouts do
+        use MyAppWeb, :html
+
+        embed_sface "layouts/root.sface"
+        embed_sface "layouts/app.sface"
+      end
+
+  The code above generates two functions, `root` and `app`. You can use both
+  as regular function components or as layout templates.
+  """
+  defmacro embed_sface(relative_file) do
+    file =
+      __CALLER__.file
+      |> Path.dirname()
+      |> Path.join(relative_file)
+
+    if File.exists?(file) do
+      name = file |> Path.rootname() |> Path.basename()
+
+      quote bind_quoted: [file: file, name: name] do
+        @external_resource file
+        @file file
+
+        body = Surface.__compile_sface__(name, file, __ENV__)
+
+        def unquote(String.to_atom(name))(var!(assigns)) do
+          _ = var!(assigns)
+          unquote(body)
+        end
+      end
+    else
+      message = """
+      could not read template "#{relative_file}": no such file or directory. \
+      Trying to read file "#{file}".
+      """
+
+      IOHelper.compile_error(message, __CALLER__.file, __CALLER__.line)
+    end
+  end
+
+  @doc false
+  def __compile_sface__(name, file, env) do
+    file
+    |> File.read!()
+    |> Surface.Compiler.compile(1, env, file)
+    |> Surface.Compiler.to_live_struct(
+      caller: %Macro.Env{env | file: file, line: 1, function: {String.to_atom(name), 1}},
+      annotate_content: annotate_content()
     )
   end
 
@@ -131,7 +187,7 @@ defmodule Surface do
 
   The code must be passed with the `do` block using the `~F` sigil.
 
-  Optional `line` and `file` metadata can be passed using `opts`.
+  Optional `line`, `file` and `caller` metadata can be passed using `opts`.
 
   ## Example
 
@@ -161,10 +217,11 @@ defmodule Surface do
 
     line = Keyword.get(opts, :line, default_line)
     file = Keyword.get(opts, :file, __CALLER__.file)
+    caller = Keyword.get(opts, :caller, quote(do: __ENV__))
     indentation = Keyword.get(string_meta, :indentation, 0)
 
     quote do
-      Surface.Compiler.compile(unquote(code), unquote(line), __ENV__, unquote(file),
+      Surface.Compiler.compile(unquote(code), unquote(line), unquote(var!(caller)), unquote(file),
         checks: [no_undefined_assigns: false],
         indentation: unquote(indentation),
         column: 1,
@@ -196,75 +253,112 @@ defmodule Surface do
   @doc "Initialize surface state in the socket"
   def init(socket) do
     socket
-    |> LiveView.assign_new(:__surface__, fn -> %{} end)
-    |> LiveView.assign_new(:__context__, fn -> %{} end)
+    |> Phoenix.Component.assign_new(:__context__, fn -> %{} end)
+  end
+
+  @doc false
+  def components(opts \\ []) do
+    only_current_project = Keyword.get(opts, :only_current_project, false)
+    project_app = Mix.Project.config()[:app]
+
+    apps =
+      if only_current_project do
+        [project_app]
+      else
+        :ok = Application.ensure_loaded(project_app)
+        project_deps_apps = Application.spec(project_app, :applications) || []
+        [project_app | project_deps_apps]
+      end
+
+    for app <- apps,
+        deps_apps = Application.spec(app)[:applications] || [],
+        app in [:surface, project_app] or :surface in deps_apps,
+        {dir, files} = app_beams_dir_and_files(app),
+        file <- files,
+        List.starts_with?(file, ~c"Elixir.") do
+      :filename.join(dir, file)
+    end
+    |> Enum.chunk_every(50)
+    |> Task.async_stream(fn files ->
+      for file <- files,
+          {:ok, {_, [{_, chunk} | _]}} = :beam_lib.chunks(file, [~c"Attr"]),
+          chunk |> :erlang.binary_to_term() |> Keyword.get(:component_type) do
+        file |> Path.basename(".beam") |> String.to_atom()
+      end
+    end)
+    |> Enum.flat_map(fn {:ok, result} -> result end)
+  end
+
+  defp app_beams_dir_and_files(app) do
+    dir =
+      app
+      |> Application.app_dir()
+      |> Path.join("ebin")
+      |> String.to_charlist()
+
+    {:ok, files} = :file.list_dir(dir)
+    {dir, files}
   end
 
   @doc false
   def default_props(module) do
-    props = if function_exported?(module, :__props__, 0), do: module.__props__(), else: []
+    # The function_exported? call returns false if the module hasn't been loaded yet. Calling
+    # module.__info__(:module) forces the module to be loaded and it turned out to be cheaper
+    # then Code.ensure_loaded/1, so we use it instead to guarantee we get the props.
+    props =
+      if function_exported?(module, :__props__, 0) or
+           (module && function_exported?(module.__info__(:module), :__props__, 0)) do
+        module.__props__()
+      else
+        []
+      end
+
     Enum.map(props, fn %{name: name, opts: opts} -> {name, opts[:default]} end)
   end
 
   @doc false
-  def build_assigns(
-        context,
-        static_props,
-        dynamic_props,
-        slot_props,
-        slots,
-        module,
-        node_alias
-      ) do
-    static_prop_names = Keyword.keys(static_props)
+  def build_dynamic_assigns(context, static_props, dynamic_props, module, node_alias, ctx) do
+    static_props =
+      for {name, value} <- static_props || [] do
+        {clauses, opts, original} =
+          case value do
+            # Value is an expression
+            {_clauses, _opts, _original} ->
+              value
 
-    dynamic_props =
-      (dynamic_props || [])
-      |> Enum.filter(fn {name, _} -> not Enum.member?(static_prop_names, name) end)
-      |> Enum.map(fn {name, value} ->
-        {name, Surface.TypeHandler.runtime_prop_value!(module, name, value, node_alias || module)}
-      end)
+            # Value is a literal
+            _ ->
+              {[value], [], nil}
+          end
+
+        {name, TypeHandler.runtime_prop_value!(module, name, clauses, opts, inspect(module), original, ctx)}
+      end
+
+    build_assigns(context, static_props, dynamic_props, module, node_alias, ctx)
+  end
+
+  @doc false
+  def build_assigns(context, static_props, dynamic_props, module, node_alias, ctx) do
+    static_prop_names = Keyword.keys(static_props) |> Enum.uniq()
+    only_dynamic_props = Enum.reject(dynamic_props, &Enum.member?(static_prop_names, elem(&1, 0)))
 
     props =
       module
       |> default_props()
-      |> Keyword.merge(dynamic_props)
-      |> Keyword.merge(static_props)
-
-    slot_assigns = map_slots_to_assigns(module, slot_props)
+      |> Keyword.merge(runtime_props!(static_props, module, node_alias, ctx))
+      |> Keyword.merge(runtime_props!(only_dynamic_props, module, node_alias, ctx))
 
     if module do
-      Map.new(
-        props ++
-          slot_assigns ++
-          [
-            __surface__: %{
-              slots: Map.new(slots),
-              provided_templates: Keyword.keys(slot_props)
-            },
-            __context__: context
-          ]
-      )
+      Map.new([__context__: context] ++ props)
     else
-      # Function components don't support slots nor contexts
+      # Function components don't support contexts
       Map.new(props)
     end
   end
 
-  defp map_slots_to_assigns(module, slot_props) do
-    slots = if function_exported?(module, :__slots__, 0), do: module.__slots__(), else: []
-
-    mapping =
-      slots
-      |> Enum.map(fn %{name: name, opts: opts} -> {name, Keyword.get(opts, :as)} end)
-      |> Enum.filter(fn value -> not match?({_, nil}, value) end)
-
-    Enum.map(slot_props, fn {name, info} -> {Keyword.get(mapping, name, name), info} end)
-  end
-
   @doc false
   def css_class(value) when is_list(value) do
-    with {:ok, value} <- Surface.TypeHandler.CssClass.expr_to_value(value, []),
+    with {:ok, value} <- Surface.TypeHandler.CssClass.expr_to_value(value, [], _ctx = %{}),
          {:ok, string} <- Surface.TypeHandler.CssClass.value_to_html("class", value) do
       string
     else
@@ -276,17 +370,12 @@ defmodule Surface do
     end
   end
 
-  @doc false
-  def event_to_opts(%{name: name, target: :live_view}, event_name) do
-    [{event_name, name}]
-  end
-
-  def event_to_opts(%{name: name, target: target}, event_name) do
-    [{event_name, name}, {:phx_target, target}]
-  end
-
   def event_to_opts(nil, _event_name) do
     []
+  end
+
+  def event_to_opts(value, event_name) do
+    [{event_name, Surface.TypeHandler.Event.normalize_value(value)}]
   end
 
   @doc false
@@ -318,58 +407,99 @@ defmodule Surface do
 
     ```
     <div :if={slot_assigned?(:header)}>
-      <#slot name="header"/>
+      <#slot {@header}/>
     </div>
     ```
   """
-  defmacro slot_assigned?(slot) do
-    defined_slots =
-      API.get_slots(__CALLER__.module)
-      |> Enum.map(& &1.name)
-      |> Enum.uniq()
-
-    if slot not in defined_slots do
-      undefined_slot(defined_slots, slot, __CALLER__)
-    end
+  defmacro slot_assigned?(slot) when is_atom(slot) do
+    validate_undefined_slot(slot, __CALLER__)
 
     quote do
-      unquote(__MODULE__).slot_assigned?(var!(assigns), unquote(slot))
+      !!var!(assigns)[unquote(slot)]
     end
   end
 
-  @doc false
-  def slot_assigned?(%{__surface__: %{provided_templates: slots}}, slot), do: slot in slots
-  def slot_assigned?(_, _), do: false
+  defmacro slot_assigned?({{:., _, [{:assigns, _, _}, slot_name]}, _, _} = slot) do
+    validate_undefined_slot(slot_name, __CALLER__)
 
-  defp undefined_slot(defined_slots, slot_name, caller) do
-    similar_slot_message =
-      case Helpers.did_you_mean(slot_name, defined_slots) do
-        {similar, score} when score > 0.8 ->
-          "\n\n  Did you mean #{inspect(to_string(similar))}?"
+    quote do
+      !!unquote(slot)
+    end
+  end
 
-        _ ->
+  defp validate_undefined_slot(slot_name, caller) do
+    defined_slots =
+      API.get_slots(caller.module)
+      |> Enum.map(& &1.name)
+      |> Enum.uniq()
+
+    if slot_name not in defined_slots do
+      similar_slot_message =
+        case Helpers.did_you_mean(slot_name, defined_slots) do
+          {similar, score} when score > 0.8 ->
+            "\n\n  Did you mean #{inspect(to_string(similar))}?"
+
+          _ ->
+            ""
+        end
+
+      existing_slots_message =
+        if defined_slots == [] do
           ""
-      end
+        else
+          slots =
+            defined_slots
+            |> Enum.map(&to_string/1)
+            |> Enum.sort()
 
-    existing_slots_message =
-      if defined_slots == [] do
-        ""
-      else
-        slots =
-          defined_slots
-          |> Enum.map(&to_string/1)
-          |> Enum.sort()
+          available = Helpers.list_to_string("slot:", "slots:", slots)
+          "\n\n  Available #{available}"
+        end
 
-        available = Helpers.list_to_string("slot:", "slots:", slots)
-        "\n\n  Available #{available}"
-      end
+      message = """
+      no slot "#{slot_name}" defined in the component '#{caller.module}'\
+      #{similar_slot_message}\
+      #{existing_slots_message}\
+      """
 
-    message = """
-    no slot "#{slot_name}" defined in the component '#{caller.module}'\
-    #{similar_slot_message}\
-    #{existing_slots_message}\
-    """
+      IOHelper.warn(message, caller)
+    end
+  end
 
-    IOHelper.warn(message, caller)
+  defp runtime_props!(props, module, node_alias, ctx) do
+    props
+    |> Enum.map(fn
+      {:__root__, value} -> maybe_root_prop(module, node_alias, ctx, value)
+      {name, value} -> {name, value}
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Enum.map(fn {name, values} ->
+      runtime_value = TypeHandler.runtime_prop_value!(module, name, values, [], node_alias, nil, ctx)
+      {name, runtime_value}
+    end)
+  end
+
+  defp maybe_root_prop(module, node_alias, ctx, value) do
+    case Enum.find(module.__props__(), & &1.opts[:root]) do
+      nil ->
+        message = """
+        no root property defined for component <#{node_alias}>
+
+        Hint: you can declare a root property using option `root: true`
+        """
+
+        IOHelper.warn(message, %Macro.Env{module: ctx.module}, ctx.file, ctx.line)
+        nil
+
+      root_prop ->
+        {root_prop.name, value}
+    end
+  end
+
+  defp annotate_content do
+    Code.ensure_loaded?(Phoenix.LiveView.HTMLEngine) &&
+      function_exported?(Phoenix.LiveView.HTMLEngine, :annotate_body, 1) &&
+      (&Phoenix.LiveView.HTMLEngine.annotate_body/1)
   end
 end

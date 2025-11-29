@@ -1,12 +1,12 @@
 defmodule Mix.Tasks.Surface.Convert do
-  @shortdoc "Converts .sface files and ~H sigils from pre-v0.5 to v0.5 syntax"
+  @shortdoc "Converts .sface files and ~F sigils from v0.7 to v0.8 syntax"
 
   @moduledoc """
-  Converts .sface files and ~H sigils from pre-v0.5 to v0.5 syntax.
+  Converts .sface files and ~F sigils from v0.7 to v0.8 syntax.
 
       mix surface.convert "lib/**/*.{ex,exs,sface}" "test/**/*.{ex,exs}"
 
-  Please read the [Migration Guide](https://github.com/surface-ui/surface/blob/master/MIGRATING.md)
+  Please read the [Migration Guide](https://github.com/surface-ui/surface/blob/main/MIGRATING.md)
   before running the converter and make sure you follow all required steps for a successful migration.
 
   ## Task-specific options
@@ -29,57 +29,58 @@ defmodule Mix.Tasks.Surface.Convert do
   use Mix.Task
 
   alias Surface.Compiler.Converter
-  alias Surface.Compiler.Converter_0_5
+  alias Surface.Compiler.Converter_0_8
 
-  @converter Converter_0_5
+  @converter Converter_0_8
 
-  defp format_string(string) do
-    Converter.convert(string, converter: @converter)
+  defp format_string(string, converter) do
+    Converter.convert(string, converter: converter)
   end
 
   #
-  # Functions unique to surface.format (Everything else is taken from Mix.Tasks.Format)
+  # Functions unique to surface.convert (Everything else is taken from Mix.Tasks.Format)
   #
 
   @doc false
-  def convert_file_contents!(file, input) do
+  def convert_file_contents!(:stdin, input, converter) do
+    # determine whether the input is Elixir or Surface code by checking if `Code.string_to_quoted` can parse it
+    case Code.string_to_quoted(input) do
+      {:ok, _} ->
+        convert_ex_string!(input, converter)
+
+      {:error, _} ->
+        format_string(input, converter)
+    end
+  end
+
+  def convert_file_contents!(file, input, converter) do
     ext = Path.extname(file)
 
     content =
       case ext do
         ".sface" ->
-          format_string(input)
+          format_string(input, converter)
 
         _ ->
-          convert_ex_string!(input)
+          convert_ex_string!(input, converter)
       end
 
-    @converter.after_convert_file(ext, content)
+    converter.after_convert_file(ext, content)
   end
 
-  defp convert_ex_string!(input) do
-    string =
-      Regex.replace(~r/( *)~H"\""(.*?)"""(\s)/s, input, fn _match, indent, code, space_after ->
-        "#{indent}~H\"\"\"#{format_string(code)}\"\"\"#{space_after}"
-      end)
-
-    string =
-      Regex.replace(~r/~H\"([^\"].*?)\"/s, string, fn _match, code ->
-        "~H\"#{format_string(code)}\""
-      end)
-
-    string =
-      Regex.replace(~r/~H\[(.*?)\]/s, string, fn _match, code ->
-        "~H[#{format_string(code)}]"
-      end)
-
-    string =
-      Regex.replace(~r/~H\((.*?)\)/s, string, fn _match, code ->
-        "~H(#{format_string(code)})"
-      end)
-
-    Regex.replace(~r/~H\{(.*?)\}/s, string, fn _match, code ->
-      "~H{#{format_string(code)}}"
+  defp convert_ex_string!(input, converter) do
+    [
+      {~r/( *)~F"\""(.*?)"""(\s)/s,
+       fn _match, indent, code, space_after ->
+         "#{indent}~F\"\"\"#{format_string(code, converter)}\"\"\"#{space_after}"
+       end},
+      {~r/~F\"([^\"].*?)\"/s, fn _match, code -> "~F\"#{format_string(code, converter)}\"" end},
+      {~r/~F\[(.*?)\]/s, fn _match, code -> "~F[#{format_string(code, converter)}]" end},
+      {~r/~F\((.*?)\)/s, fn _match, code -> "~F(#{format_string(code, converter)})" end},
+      {~r/~F\{(.*?)\}/s, fn _match, code -> "~F{#{format_string(code, converter)}}" end}
+    ]
+    |> Enum.reduce(input, fn {regex, replacement}, code ->
+      Regex.replace(regex, code, replacement)
     end)
   end
 
@@ -99,14 +100,22 @@ defmodule Mix.Tasks.Surface.Convert do
 
     args
     |> expand_args(dot_formatter, formatter_opts)
-    |> Task.async_stream(&convert_file(&1, opts), ordered: false, timeout: 30000)
+    |> Task.async_stream(&convert_file(&1, opts, @converter), ordered: false, timeout: 30000)
     |> Enum.reduce([], &collect_status/2)
     |> check!()
   end
 
-  defp convert_file({file, _formatter_opts}, task_opts) do
-    input = File.read!(file)
-    formatted = convert_file_contents!(file, input)
+  defp read_file(:stdin) do
+    {IO.stream(:stdio, :line) |> Enum.to_list() |> IO.iodata_to_binary(), :stdin}
+  end
+
+  defp read_file(file) do
+    {File.read!(file), file}
+  end
+
+  defp convert_file({file, _formatter_opts}, task_opts, converter) do
+    {input, file} = read_file(file)
+    formatted = convert_file_contents!(file, input, converter)
     output = IO.iodata_to_binary([formatted])
 
     dry_run? = Keyword.get(task_opts, :dry_run, false)

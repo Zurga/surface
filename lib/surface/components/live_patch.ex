@@ -1,5 +1,11 @@
 defmodule Surface.Components.LivePatch do
   @moduledoc """
+  > #### Deprecation warning {: .warning}
+  >
+  > This component has been deprecated in favor of liveview's built-in `<.link>`
+  > and will be removed in `v0.13`. See https://hexdocs.pm/phoenix_live_view/live-navigation.html for
+  > more info and usage.
+
   Defines a link that will **patch** the current LiveView.
 
   Provides similar capabilities to Phoenix's built-in `live_patch/2`
@@ -11,6 +17,8 @@ defmodule Surface.Components.LivePatch do
   whole page. For live redirects to another LiveView, use
   `<LiveRedirect>` instead.
   """
+
+  @moduledoc deprecated: "Use Liveview's built-in `<.link>` instead"
 
   use Surface.Component
 
@@ -39,13 +47,17 @@ defmodule Surface.Components.LivePatch do
   """
   slot default
 
+  if Mix.env() != :test do
+    @deprecated "Use liveview's built-in `<.link>` instead"
+  end
+
   def render(assigns) do
     ~F"""
     <a
+      href={@to}
       class={@class}
       data-phx-link="patch"
       data-phx-link-state={if @replace, do: "replace", else: "push"}
-      href={@to}
       :attrs={@opts}
     ><#slot>{@label}</#slot></a>
     """

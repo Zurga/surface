@@ -12,8 +12,8 @@ defmodule Surface.Directive.Let do
 
   def extract(_, _), do: []
 
-  def process(%AST.Directive{value: %AST.AttributeExpr{value: value}}, %AST.Component{} = node) do
-    update_in(node.templates, fn
+  def process(%AST.Directive{value: value}, %AST.Component{} = node) do
+    update_in(node.slot_entries, fn
       %{default: [first | others]} = tpls ->
         Map.put(tpls, :default, [%{first | let: value} | others])
 
@@ -22,8 +22,8 @@ defmodule Surface.Directive.Let do
     end)
   end
 
-  def process(%AST.Directive{value: %AST.AttributeExpr{value: value}}, %type{} = node)
-      when type in [AST.Template, AST.SlotableComponent] do
+  def process(%AST.Directive{value: value}, %type{} = node)
+      when type in [AST.SlotEntry, AST.SlotableComponent] do
     %{node | let: value}
   end
 
@@ -31,7 +31,7 @@ defmodule Surface.Directive.Let do
 
   defp directive_value(value, meta) do
     AST.AttributeExpr.new(
-      Surface.TypeHandler.expr_to_quoted!(value, ":let", :bindings, meta),
+      Surface.TypeHandler.expr_to_quoted!(value, ":let", :let_arg, meta),
       value,
       meta
     )

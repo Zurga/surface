@@ -1,8 +1,10 @@
 # This file is responsible for configuring your application
 # and its dependencies with the aid of the Mix.Config module.
-use Mix.Config
+import Config
 
-config :phoenix, :json_library, Jason
+if Mix.env() == :test do
+  config :phoenix, :json_library, Jason
+end
 
 # This configuration is loaded before any dependency and is restricted
 # to this project. If another project depends on this project, this

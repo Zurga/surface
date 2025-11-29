@@ -2,21 +2,33 @@ defmodule Surface.Directive.Events do
   use Surface.Directive
 
   @events [
+    # Click Events
     "click",
+    "click-away",
+    # TODO: Remove this when LV min is >= v0.20.15
     "capture-click",
-    "blur",
-    "focus",
+    # Form Events
     "change",
     "submit",
+    # Focus Events
+    "blur",
+    "focus",
+    "window-blur",
+    "window-focus",
+    # Key Events
     "keydown",
     "keyup",
-    "window-focus",
-    "window-blur",
     "window-keydown",
-    "window-keyup"
+    "window-keyup",
+    # Scroll Events
+    "viewport-top",
+    "viewport-bottom"
   ]
 
   @phx_events Enum.map(@events, &"phx-#{&1}")
+
+  @doc false
+  def names(), do: @events
 
   def phx_events(), do: @phx_events
 
@@ -43,14 +55,9 @@ defmodule Surface.Directive.Events do
         %type{attributes: attributes} = node
       )
       when type in [AST.Tag, AST.VoidTag] do
-    cid = AST.Meta.quoted_caller_cid(meta)
-
     value =
-      quote generated: true do
-        [
-          {unquote("phx-#{event_name}"), {:string, unquote(__MODULE__).event_name(unquote(value))}},
-          "phx-target": {:string, unquote(__MODULE__).event_target(unquote(value), unquote(cid))}
-        ]
+      quote do
+        [{unquote("phx-#{event_name}"), {:event, unquote(value)}}]
       end
 
     %{
@@ -71,45 +78,16 @@ defmodule Surface.Directive.Events do
   end
 
   defp to_quoted_expr(name, event, meta) when is_binary(event) or is_bitstring(event) do
-    AST.AttributeExpr.new(
-      Surface.TypeHandler.expr_to_quoted!(Macro.to_string(event), name, :event, meta),
-      event,
-      meta
-    )
+    quoted = Surface.TypeHandler.expr_to_quoted!(Macro.to_string(event), name, :event, meta)
+    AST.AttributeExpr.new(quoted, event, meta)
   end
 
   defp to_quoted_expr(name, {:attribute_expr, original, expr_meta}, meta) do
     expr_meta = Helpers.to_meta(expr_meta, meta)
+    quoted = Surface.TypeHandler.expr_to_quoted!(original, name, :event, expr_meta)
+    expr = AST.AttributeExpr.new(quoted, original, expr_meta)
 
-    value =
-      original
-      |> Surface.TypeHandler.expr_to_quoted!(name, :event, expr_meta)
-      |> case do
-        [name, opts] when is_binary(name) and is_list(opts) -> Keyword.put(opts, :name, name)
-        [name | opts] when is_binary(name) and is_list(opts) -> Keyword.put(opts, :name, name)
-        value -> value
-      end
-
-    AST.AttributeExpr.new(value, original, expr_meta)
-  end
-
-  def event_name(%{name: name}) do
-    name
-  end
-
-  def event_name(_) do
-    ""
-  end
-
-  def event_target(%{target: nil}, cid) do
-    to_string(cid)
-  end
-
-  def event_target(%{target: target}, _cid) when target != :live_view do
-    to_string(target)
-  end
-
-  def event_target(_, _cid) do
-    ""
+    # We force the value to be evaluated at runtime
+    %Surface.AST.AttributeExpr{expr | constant?: false}
   end
 end

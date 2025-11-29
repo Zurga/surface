@@ -1,18 +1,24 @@
 defmodule Surface.MixProject do
   use Mix.Project
 
-  @version "0.6.1"
+  @version "0.12.1"
+  @source_url "https://github.com/surface-ui/surface"
+  @homepage_url "https://surface-ui.org"
 
   def project do
     [
       app: :surface,
       version: @version,
-      elixir: "~> 1.11",
+      elixir: "~> 1.13",
       description: "A component based library for Phoenix LiveView",
-      elixirc_paths: elixirc_paths(Mix.env()),
-      compilers: [:phoenix] ++ Mix.compilers(),
       start_permanent: Mix.env() == :prod,
+      elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
+      preferred_cli_env: [docs: :docs],
+      # Docs
+      name: "Surface",
+      source_url: @source_url,
+      homepage_url: @homepage_url,
       docs: docs(),
       package: package()
     ]
@@ -27,42 +33,49 @@ defmodule Surface.MixProject do
   end
 
   defp elixirc_paths(:dev), do: ["lib"] ++ catalogues()
-  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(:test), do: ["lib", "test/support"] ++ catalogues()
   defp elixirc_paths(_), do: ["lib"]
 
+  defp catalogues do
+    ["priv/catalogue"]
+  end
+
+  # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:jason, "~> 1.0"},
-      {:phoenix_live_view, "~> 0.16.0"},
-      {:floki, "~> 0.25.0", only: :test},
-      {:phoenix_ecto, "~> 4.0", only: :test},
-      {:sourceror, "~> 0.8.5"},
-      {:ecto, "~> 3.4.2", only: :test},
-      {:ex_doc, ">= 0.19.0", only: :docs}
+      {:phoenix_live_view, "~> 0.19.0 or ~> 0.20.10 or ~> 1.0"},
+      {:sourceror, "~> 1.0"},
+      {:blend, "~> 0.3.0", only: :dev},
+      {:jason, "~> 1.0", only: :test},
+      {:floki, "~> 0.35", only: :test},
+      {:ex_doc, ">= 0.31.0", only: :docs}
     ]
   end
 
   defp docs do
     [
       main: "Surface",
+      logo: "assets/surface-logo.png",
       source_ref: "v#{@version}",
-      source_url: "https://github.com/surface-ui/surface",
       groups_for_modules: [
+        Components: ~r/Surface.Components/,
+        Catalogue: ~r/Catalogue/,
         Compiler: ~r/Compiler/,
-        Components: ~r/Surface.Component/,
         Directives: ~r/Surface.Directive/,
         AST: ~r/AST/,
-        Catalogue: ~r/Catalogue/
+        Formatter: [~r/Formatter$/, ~r/Formatter.Phase/]
       ],
       nest_modules_by_prefix: [
         Surface.AST,
         Surface.Catalogue,
         Surface.Compiler,
         Surface.Components,
-        Surface.Directive
+        Surface.Directive,
+        Surface.Formatter.Phases
       ],
       extras: [
         "CHANGELOG.md",
+        "MIGRATING.md",
         "LICENSE.md"
       ]
     ]
@@ -71,11 +84,20 @@ defmodule Surface.MixProject do
   defp package do
     %{
       licenses: ["MIT"],
-      links: %{"GitHub" => "https://github.com/surface-ui/surface"}
+      links: %{
+        Website: @homepage_url,
+        Changelog: "https://hexdocs.pm/surface/changelog.html",
+        GitHub: @source_url
+      },
+      files: ~w(
+        README.md
+        CHANGELOG.md
+        LICENSE.md
+        mix.exs
+        .formatter.exs
+        lib
+        priv/templates/surface.init
+      )
     }
-  end
-
-  defp catalogues do
-    ["priv/catalogue"]
   end
 end

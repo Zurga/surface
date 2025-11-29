@@ -1,10 +1,10 @@
 defmodule Surface.Compiler.Tokenizer do
   @moduledoc false
-  @space_chars '\n\r\t\f\s'
-  @name_stop_chars @space_chars ++ '>/='
-  @unquoted_value_invalid_chars '"\'=<`'
-  @unquoted_value_stop_chars @space_chars ++ '>'
-  @block_name_stop_chars @space_chars ++ '}'
+  @space_chars ~c"\n\r\t\f\s"
+  @name_stop_chars @space_chars ++ ~c">/="
+  @unquoted_value_invalid_chars ~c"\"'=<`"
+  @unquoted_value_stop_chars @space_chars ++ ~c">"
+  @block_name_stop_chars @space_chars ++ ~c"}"
   @markers ["=", "...", "$", "^", ~S(~")]
 
   @ignored_body_tags ["style", "script"]
@@ -14,15 +14,18 @@ defmodule Surface.Compiler.Tokenizer do
     "base",
     "br",
     "col",
+    "command",
+    "embed",
     "hr",
     "img",
     "input",
+    "keygen",
     "link",
     "meta",
     "param",
-    "command",
-    "keygen",
-    "source"
+    "source",
+    "track",
+    "wbr"
   ]
 
   @type metadata :: %{
@@ -77,8 +80,7 @@ defmodule Surface.Compiler.Tokenizer do
     column = Keyword.get(opts, :column, 1)
     indentation = Keyword.get(opts, :indentation, 0)
 
-    # TODO: Fix for the converter. Remove `embedded_expr?` eventually after 0.5.0 is released
-    state = %{file: file, column_offset: indentation + 1, braces: [], embedded_expr?: false}
+    state = %{file: file, column_offset: indentation + 1, braces: []}
 
     handle_text(text, line, column, [], [], state)
   end
@@ -619,23 +621,6 @@ defmodule Surface.Compiler.Tokenizer do
     column = state.column_offset
     handle_attr_value_double_quote(rest, line + 1, column, ["\n" | buffer], acc, state)
   end
-
-  # TODO: Fix for the converter. Remove it eventually after 0.5.0 is released
-  defp handle_attr_value_double_quote("{{" <> rest, line, column, buffer, acc, state) do
-    state = %{state | embedded_expr?: true}
-    handle_attr_value_double_quote(rest, line, column + 2, ["{{" | buffer], acc, state)
-  end
-
-  defp handle_attr_value_double_quote("}}" <> rest, line, column, buffer, acc, state) do
-    state = %{state | embedded_expr?: false}
-    handle_attr_value_double_quote(rest, line, column + 2, ["{{" | buffer], acc, state)
-  end
-
-  defp handle_attr_value_double_quote("\"" <> rest, line, column, buffer, acc, %{embedded_expr?: true} = state) do
-    handle_attr_value_double_quote(rest, line, column + 1, ["\"" | buffer], acc, state)
-  end
-
-  ###
 
   defp handle_attr_value_double_quote("\"" <> rest, line, column, buffer, acc, state) do
     value = buffer_to_string(buffer)

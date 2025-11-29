@@ -95,9 +95,9 @@ defmodule Surface.EventsTest do
         """
       end
 
-    assert html =~ """
-           <button phx-click="click" phx-target="1"\
-           """
+    doc = parse_document!(html)
+
+    assert js_attribute(doc, "div > button", "phx-click") == [["push", %{"event" => "click", "target" => 1}]]
   end
 
   test "handle event locally" do
@@ -110,9 +110,9 @@ defmodule Surface.EventsTest do
         """
       end
 
-    assert html =~ """
-           <button phx-click="click" phx-target="1"\
-           """
+    doc = parse_document!(html)
+
+    assert js_attribute(doc, "div > button", "phx-click") == [["push", %{"event" => "click", "target" => 1}]]
   end
 
   test "override target" do
@@ -125,15 +125,15 @@ defmodule Surface.EventsTest do
         """
       end
 
-    assert html =~ """
-           phx-click="ok" phx-target="#comp"\
-           """
+    doc = parse_document!(html)
+
+    assert js_attribute(doc, "div > button", "phx-click") == [["push", %{"event" => "ok", "target" => "#comp"}]]
   end
 
   test "override target with keyword list notation" do
-    expected = """
-    phx-click="ok" phx-target="#comp"\
-    """
+    # event = html_escape(~S([["push",{"event":"ok","target":"#comp"}]]))
+
+    expected = [["push", %{"event" => "ok", "target" => "#comp"}]]
 
     # Event name as string
     html =
@@ -145,7 +145,8 @@ defmodule Surface.EventsTest do
         """
       end
 
-    assert html =~ expected
+    doc = parse_document!(html)
+    assert js_attribute(doc, "div > button", "phx-click") == expected
 
     # Event name as atom
     html =
@@ -157,7 +158,8 @@ defmodule Surface.EventsTest do
         """
       end
 
-    assert html =~ expected
+    doc = parse_document!(html)
+    assert js_attribute(doc, "div > button", "phx-click") == expected
   end
 
   test "passing event as nil does not render phx-*" do

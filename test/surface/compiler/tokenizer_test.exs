@@ -286,6 +286,11 @@ defmodule Surface.Compiler.TokenizerTest do
       assert [{:tag_open, "#Macro", [], %{self_close: true, macro?: true}}] = tokens
     end
 
+    test "void tag" do
+      tokens = tokenize!("<embed>")
+      assert [{:tag_open, "embed", [], %{void_tag?: true}}] = tokens
+    end
+
     test "compute line and column" do
       tokens =
         tokenize!("""
@@ -500,7 +505,7 @@ defmodule Surface.Compiler.TokenizerTest do
       end
     end
 
-    test "raise on missing attribure name" do
+    test "raise on missing attribute name" do
       assert_raise ParseError, "nofile:2:8: expected attribute name, got: `=`", fn ->
         tokenize!("""
         <div>

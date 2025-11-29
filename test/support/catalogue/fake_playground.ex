@@ -3,15 +3,15 @@ defmodule Surface.Catalogue.FakePlayground do
     subject: Surface.Components.FakeButton,
     catalogue: Surface.Components.FakeCatalogue
 
-  data props, :map,
-    default: %{
-      label: "My label"
-    }
+  @props [
+    label: "My label",
+    map: %{info: "info"}
+  ]
 
   def render(assigns) do
     ~F"""
     {#for {prop, value} <- @props}
-      {prop}: {value}
+      {prop}: {inspect(value)}
     {/for}
     """
   end

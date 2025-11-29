@@ -3,9 +3,17 @@ defmodule Surface.TypeHandler.CssClass do
 
   use Surface.TypeHandler
 
+  alias Surface.AST
+
   @impl true
   def literal_to_ast_node(_type, _name, "", _meta) do
     {:ok, %Surface.AST.Literal{value: ""}}
+  end
+
+  # For HTML nodes, we don't need to convert the class values into a list as
+  # no one can actually read/update those values like we do in components.
+  def literal_to_ast_node(_type, _name, value, %AST.Meta{module: nil}) do
+    {:ok, %Surface.AST.Literal{value: value}}
   end
 
   def literal_to_ast_node(type, name, value, meta) do
@@ -18,16 +26,16 @@ defmodule Surface.TypeHandler.CssClass do
   end
 
   @impl true
-  def expr_to_value([value], opts) when is_list(value) do
-    expr_to_value(value, opts)
+  def expr_to_value([value], opts, ctx) when is_list(value) do
+    expr_to_value(value, opts, ctx)
   end
 
-  def expr_to_value(clauses, opts) do
+  def expr_to_value(clauses, opts, ctx) do
     value =
       Enum.reduce(clauses ++ opts, [], fn item, classes ->
         case item do
           list when is_list(list) ->
-            case expr_to_value(list, []) do
+            case expr_to_value(list, [], ctx) do
               {:ok, new_classes} -> Enum.reverse(new_classes) ++ classes
               error -> error
             end

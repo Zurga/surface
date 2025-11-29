@@ -20,7 +20,7 @@ defmodule Surface.LiveComponentTest do
     data assigned_in_update, :any
 
     def update(_assigns, socket) do
-      {:ok, assign(socket, assigned_in_update: "Assinged in update/2")}
+      {:ok, assign(socket, assigned_in_update: "Assigned in update/2")}
     end
 
     def render(assigns) do
@@ -54,20 +54,20 @@ defmodule Surface.LiveComponentTest do
   defmodule InfoProvider do
     use Surface.Component
 
-    slot default, args: [:info]
+    slot default, arg: %{info: :string}
 
     def render(assigns) do
       info = "Hi there!"
 
       ~F"""
       <div>
-        <#slot :args={info: info}/>
+        <#slot {@default, info: info}/>
       </div>
       """
     end
   end
 
-  defmodule InfoProviderWithoutSlotArgs do
+  defmodule InfoProviderWithoutSlotArg do
     use Surface.Component
 
     slot default
@@ -105,13 +105,13 @@ defmodule Surface.LiveComponentTest do
     end
   end
 
-  test "render content without slot args" do
+  test "render content without slot arg" do
     html =
       render_surface do
         ~F"""
-        <InfoProviderWithoutSlotArgs>
+        <InfoProviderWithoutSlotArg>
           <span>Hi there!</span>
-        </InfoProviderWithoutSlotArgs>
+        </InfoProviderWithoutSlotArg>
         """
       end
 
@@ -122,7 +122,7 @@ defmodule Surface.LiveComponentTest do
            """
   end
 
-  test "render content with slot args" do
+  test "render content with slot arg" do
     html =
       render_surface do
         ~F"""
@@ -180,7 +180,7 @@ defmodule Surface.LiveComponentTest do
 
   test "render data assigned in update/2" do
     {:ok, _view, html} = live_isolated(build_conn(), View)
-    assert html =~ "Assinged in update/2"
+    assert html =~ "Assigned in update/2"
   end
 
   test "handle events in LiveComponent (handled by the component itself)" do

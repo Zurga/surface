@@ -50,12 +50,11 @@ defmodule Surface.LiveComponent do
       end
   """
 
-  alias Surface.BaseComponent
-
   defmacro __using__(_) do
     quote do
       @before_compile Surface.Renderer
       use Phoenix.LiveComponent
+      import Phoenix.Component, except: [slot: 1, slot: 2]
 
       use Surface.BaseComponent, type: unquote(__MODULE__)
 
@@ -63,6 +62,8 @@ defmodule Surface.LiveComponent do
 
       use Surface.API, include: [:prop, :slot, :data]
       import Phoenix.HTML
+
+      @before_compile {Surface.BaseComponent, :__before_compile_init_slots__}
 
       alias Surface.Components.{Context, Raw}
       alias Surface.Components.Dynamic.Component
@@ -86,13 +87,63 @@ defmodule Surface.LiveComponent do
   end
 
   defp quoted_update(env) do
+    props_specs = env.module |> Surface.API.get_props() |> Enum.reverse()
+    data_specs = env.module |> Surface.API.get_data() |> Enum.reverse()
+
+    quoted_props_assigns =
+      for %{name: name, opts: opts} <- props_specs, key = opts[:from_context] do
+        quote do
+          updated_assigns =
+            Map.put(
+              updated_assigns,
+              unquote(name),
+              var!(assigns)[unquote(name)] || var!(assigns)[:__context__][unquote(key)]
+            )
+        end
+      end
+
+    quoted_data_assigns =
+      for %{name: name, opts: opts} <- data_specs, key = opts[:from_context] do
+        quote do
+          updated_assigns = Map.put(updated_assigns, unquote(name), var!(assigns)[:__context__][unquote(key)])
+        end
+      end
+
+    quoted_updated_assigns =
+      quote do
+        updated_assigns =
+          if Map.has_key?(var!(assigns), :__context__) do
+            updated_assigns = %{}
+            unquote({:__block__, [], quoted_data_assigns ++ quoted_props_assigns})
+            updated_assigns
+          else
+            %{}
+          end
+      end
+
     if Module.defines?(env.module, {:update, 2}) do
       quote do
         defoverridable update: 2
 
-        def update(assigns, socket) do
-          {:ok, socket} = super(assigns, socket)
-          {:ok, BaseComponent.restore_private_assigns(socket, assigns)}
+        def update(var!(assigns), socket) do
+          unquote(quoted_updated_assigns)
+
+          {assigns, socket} = Surface.LiveComponent.move_private_assigns(var!(assigns), socket)
+
+          super(Map.merge(assigns, updated_assigns), socket)
+        end
+      end
+    else
+      quote do
+        def update(var!(assigns), socket) do
+          unquote(quoted_updated_assigns)
+
+          socket =
+            socket
+            |> Phoenix.Component.assign(var!(assigns))
+            |> Phoenix.Component.assign(updated_assigns)
+
+          {:ok, socket}
         end
       end
     end
@@ -123,5 +174,14 @@ defmodule Surface.LiveComponent do
         end
       end
     end
+  end
+
+  @private_assigns [:__context__, :__caller_scope_id__]
+  @doc false
+  def move_private_assigns(assigns, socket) do
+    {
+      Map.drop(var!(assigns), @private_assigns),
+      Phoenix.Component.assign(socket, Map.take(var!(assigns), @private_assigns))
+    }
   end
 end

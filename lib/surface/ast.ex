@@ -6,16 +6,18 @@ defmodule Surface.AST.Container do
 
   ## Properties
       * `:children` - children AST nodes
+      * `:attributes` - the specified attributes
       * `:directives` - directives associated with this container
       * `:meta` - compile meta
       * `:debug` - keyword list indicating when debug information should be printed during compilation
   """
-  defstruct [:children, :meta, debug: [], directives: []]
+  defstruct [:children, :meta, debug: [], attributes: [], directives: []]
 
   @type t :: %__MODULE__{
           children: list(Surface.AST.t()),
           debug: list(atom()),
           meta: Surface.AST.Meta.t(),
+          attributes: list(Surface.AST.Attribute.t()),
           directives: list(Surface.AST.Directive.t())
         }
 end
@@ -91,14 +93,29 @@ defmodule Surface.AST.Meta do
 
   ## Properties
       * `:line` - the line from the source code where the parent was extracted
+      * `:column` - the column from the source code where the parent was extracted
       * `:module` - the component module (e.g. `Surface.Components.LivePatch`)
       * `:node_alias` - the alias used inside the source code (e.g. `LivePatch`)
       * `:file` - the file from which the source was extracted
       * `:caller` - a Macro.Env struct representing the caller
-      * `:function_component?` - indicates if it's a function component or not
+      * `:style` - the style info of the component, if any
+      * `:caller_spec` - the specs of the caller component
   """
-  @derive {Inspect, only: [:line, :column, :module, :node_alias, :file, :checks, :function_component?]}
-  defstruct [:line, :column, :module, :node_alias, :file, :caller, :checks, :function_component?]
+
+  alias Surface.Compiler.Helpers
+
+  @derive {Inspect, only: [:line, :column, :module, :node_alias, :file, :checks]}
+  defstruct [
+    :line,
+    :column,
+    :module,
+    :node_alias,
+    :file,
+    :caller,
+    :checks,
+    :style,
+    :caller_spec
+  ]
 
   @type t :: %__MODULE__{
           line: non_neg_integer(),
@@ -108,19 +125,33 @@ defmodule Surface.AST.Meta do
           caller: Macro.Env.t(),
           file: binary(),
           checks: Keyword.t(boolean()),
-          function_component?: boolean()
+          caller_spec: struct(),
+          style:
+            %{
+              scope_id: binary(),
+              css: binary(),
+              selectors: [binary()],
+              vars: %{(var :: binary()) => expr :: binary()}
+            }
+            | nil
         }
 
-  def quoted_caller_cid(meta) do
-    cond do
-      Module.open?(meta.caller.module) and
-          Module.get_attribute(meta.caller.module, :component_type) == Surface.LiveComponent ->
-        quote generated: true do
-          @myself
-        end
-
-      true ->
+  @doc false
+  def quoted_caller_context(meta) do
+    quoted_cid =
+      if Helpers.is_stateful_component(meta.caller.module) and meta.caller.function == {:render, 1} do
+        quote do: @myself
+      else
         nil
+      end
+
+    quote do
+      %{
+        cid: unquote(quoted_cid),
+        file: unquote(meta.file),
+        line: unquote(meta.line),
+        module: unquote(meta.caller.module)
+      }
     end
   end
 end
@@ -200,15 +231,17 @@ defmodule Surface.AST.Attribute do
       * `:type` - an atom representing the type of attribute. See Surface.API for the list of supported types
       * `:type_opts` - a keyword list of options for the type
       * `:name` - the name of the attribute (e.g. `:class`)
+      * `:root` - true if the attribute was defined using root notation `{ ... }`. Root attributes won't have `name`.
       * `:value` - a list of nodes that can be concatenated to form the value for this attribute. Potentially contains dynamic data
       * `:meta` - compilation meta data
   """
-  defstruct [:name, :type, :type_opts, :value, :meta]
+  defstruct [:name, :root, :type, :type_opts, :value, :meta]
 
   @type t :: %__MODULE__{
-          type: atom(),
-          type_opts: keyword(),
-          name: atom(),
+          type: atom() | nil,
+          type_opts: keyword() | nil,
+          name: atom() | nil,
+          root: boolean() | nil,
           value: Surface.AST.Literal.t() | Surface.AST.AttributeExpr.t(),
           meta: Surface.AST.Meta.t()
         }
@@ -261,10 +294,9 @@ defmodule Surface.AST.AttributeExpr do
 
   defp constant?(
          {{:., _, [{:__aliases__, _, [:Surface, :TypeHandler]}, :expr_to_value!]}, _,
-          [_type, _name, clauses, opts, _module, _original]}
+          [_type, _name, clauses, opts, _module, _original, ctx]}
        ) do
-    Macro.quoted_literal?(clauses) and
-      Macro.quoted_literal?(opts)
+    Macro.quoted_literal?(clauses) and Macro.quoted_literal?(opts) and Macro.quoted_literal?(ctx)
   end
 
   defp constant?(expr) do
@@ -297,25 +329,29 @@ end
 
 defmodule Surface.AST.Slot do
   @moduledoc """
-  An AST node representing a <#slot /> element
+  An AST node representing a <#slot /> tag
 
   ## Properties
       * `:name` - the slot name
-      * `:index` - the index of the slotable entry assigned to this slot
+      * `:for` - the slotable entry assigned for this slot
       * `:default` - a list of AST nodes representing the default content for this slot
-      * `:args` - either an atom or a quoted expression representing arguments for this slot
+      * `:arg` - quoted expression representing the argument for this slot
+      * `:generator_value` - value from the `:generator_prop` property
+      * `:context_put` - value from the `:generator_prop` property
       * `:meta` - compilation meta data
       * `:directives` - directives associated with this slot
   """
-  defstruct [:name, :index, :args, :default, :meta, directives: []]
+  defstruct [:name, :as, :for, :arg, :generator_value, :context_put, :default, :meta, directives: []]
 
   @type t :: %__MODULE__{
           name: binary(),
-          index: any(),
+          as: atom(),
+          for: any(),
           directives: list(Surface.AST.Directive.t()),
           meta: Surface.AST.Meta.t(),
-          # quoted ?
-          args: list(Keyword.t(any())),
+          arg: Macro.t(),
+          generator_value: any(),
+          context_put: list(Surface.AST.AttributeExpr.t()),
           default: list(Surface.AST.t())
         }
 end
@@ -383,26 +419,27 @@ defmodule Surface.AST.VoidTag do
         }
 end
 
-defmodule Surface.AST.Template do
+defmodule Surface.AST.SlotEntry do
   @moduledoc """
-  An AST node representing a <#template> element. This is used to provide content for slots
+  An AST node representing a <:slot> entry. This is used to provide content for slots
 
   ## Properties
-      * `:name` - the template name
-      * `:let` - the bindings for this template
-      * `:children` - the template children
+      * `:name` - the slot entry name
+      * `:props` - the props for slot entry tag
+      * `:let` - the `:let` expression
+      * `:children` - the slot entry children
       * `:meta` - compilation meta data
       * `:debug` - keyword list indicating when debug information should be printed during compilation
-      * `:directives` - directives associated with this template
+      * `:directives` - directives associated with this slot entry
   """
-  defstruct [:name, :children, :let, :meta, directives: []]
+  defstruct [:name, :props, :children, :let, :meta, directives: []]
 
   @type t :: %__MODULE__{
           name: atom(),
           children: list(Surface.AST.t()),
           directives: list(Surface.AST.Directive.t()),
-          # quoted?
-          let: list(Keyword.t(atom())),
+          props: list(Surface.AST.Attribute.t() | Surface.AST.DynamicAttribute.t()),
+          let: Surface.AST.AttributeExpr.t() | nil,
           meta: Surface.AST.Meta.t()
         }
 end
@@ -414,12 +451,14 @@ defmodule Surface.AST.Error do
   ## Properties
       * `:message` - the error message
       * `:meta` - compilation meta data
+      * `:attributes` - the specified attributes
       * `:directives` - directives associated with this error node
   """
-  defstruct [:message, :meta, directives: []]
+  defstruct [:message, :meta, attributes: [], directives: []]
 
   @type t :: %__MODULE__{
           message: binary(),
+          attributes: list(Surface.AST.Attribute.t()),
           directives: list(Surface.AST.Directive.t()),
           meta: Surface.AST.Meta.t()
         }
@@ -438,7 +477,7 @@ defmodule Surface.AST.Component do
       * `:meta` - compilation meta data
       * `:debug` - keyword list indicating when debug information should be printed during compilation
   """
-  defstruct [:module, :type, :props, :dynamic_props, :templates, :meta, debug: [], directives: []]
+  defstruct [:module, :type, :props, :dynamic_props, :slot_entries, :meta, debug: [], directives: []]
 
   @type t :: %__MODULE__{
           module: module() | Surface.AST.AttributeExpr.t(),
@@ -447,9 +486,9 @@ defmodule Surface.AST.Component do
           props: list(Surface.AST.Attribute.t()),
           dynamic_props: Surface.AST.DynamicAttribute.t(),
           directives: list(Surface.AST.Directive.t()),
-          templates: %{
-            :default => list(Surface.AST.Template.t() | Surface.AST.SlotableComponent.t()),
-            optional(atom()) => list(Surface.AST.Template.t() | Surface.AST.SlotableComponent.t())
+          slot_entries: %{
+            :default => list(Surface.AST.SlotEntry.t() | Surface.AST.SlotableComponent.t()),
+            optional(atom()) => list(Surface.AST.SlotEntry.t() | Surface.AST.SlotableComponent.t())
           },
           meta: Surface.AST.Meta.t()
         }
@@ -469,7 +508,7 @@ defmodule Surface.AST.FunctionComponent do
       * `:meta` - compilation meta data
       * `:debug` - keyword list indicating when debug information should be printed during compilation
   """
-  defstruct [:module, :fun, :type, :props, :dynamic_props, :templates, :meta, debug: [], directives: []]
+  defstruct [:module, :fun, :type, :props, :dynamic_props, :slot_entries, :meta, debug: [], directives: []]
 
   @type t :: %__MODULE__{
           module: module() | Surface.AST.AttributeExpr.t(),
@@ -479,9 +518,9 @@ defmodule Surface.AST.FunctionComponent do
           props: list(Surface.AST.Attribute.t()),
           dynamic_props: Surface.AST.DynamicAttribute.t(),
           directives: list(Surface.AST.Directive.t()),
-          templates: %{
-            :default => list(Surface.AST.Template.t() | Surface.AST.SlotableComponent.t()),
-            optional(atom()) => list(Surface.AST.Template.t() | Surface.AST.SlotableComponent.t())
+          slot_entries: %{
+            :default => list(Surface.AST.SlotEntry.t() | Surface.AST.SlotableComponent.t()),
+            optional(atom()) => list(Surface.AST.SlotEntry.t() | Surface.AST.SlotableComponent.t())
           },
           meta: Surface.AST.Meta.t()
         }
@@ -495,11 +534,11 @@ defmodule Surface.AST.MacroComponent do
       * `:module` - the component module
       * `:attributes` - the specified attributes
       * `:directives` - any directives to be applied to this macro
-      * `:body` - the macro body
+      * `:children` - the children after the macro is expanded
       * `:meta` - compilation meta data
       * `:debug` - keyword list indicating when debug information should be printed during compilation
   """
-  defstruct [:module, :name, :attributes, :body, :meta, debug: [], directives: []]
+  defstruct [:module, :name, :attributes, :children, :meta, debug: [], directives: []]
 
   @type t :: %__MODULE__{
           module: module(),
@@ -507,7 +546,7 @@ defmodule Surface.AST.MacroComponent do
           name: binary(),
           attributes: list(Surface.AST.Attribute.t()),
           directives: list(Surface.AST.Directive.t()),
-          body: iodata(),
+          children: list(Surface.AST.t()),
           meta: Surface.AST.Meta.t()
         }
 end
@@ -520,7 +559,7 @@ defmodule Surface.AST.SlotableComponent do
       * `:module` - the component module
       * `:type` - the type of component (i.e. Surface.LiveComponent vs Surface.Component)
       * `:slot` - the name of the slot that this component is for
-      * `:let` - the bindings for this template
+      * `:let` - the `:let` expression
       * `:props` - the props for this component
       * `:directives` - any directives to be applied to this tag
       * `:children` - the tag children
@@ -534,7 +573,7 @@ defmodule Surface.AST.SlotableComponent do
     :let,
     :props,
     :dynamic_props,
-    :templates,
+    :slot_entries,
     :meta,
     debug: [],
     directives: []
@@ -545,13 +584,13 @@ defmodule Surface.AST.SlotableComponent do
           debug: list(atom()),
           type: module(),
           slot: atom(),
-          let: list(Keyword.t(atom())),
+          let: Surface.AST.AttributeExpr.t() | nil,
           props: list(Surface.AST.Attribute.t()),
           dynamic_props: Surface.AST.DynamicAttribute.t(),
           directives: list(Surface.AST.Directive.t()),
-          templates: %{
-            :default => list(Surface.AST.Template.t()),
-            optional(atom()) => list(Surface.AST.Template.t())
+          slot_entries: %{
+            :default => list(Surface.AST.SlotEntry.t()),
+            optional(atom()) => list(Surface.AST.SlotEntry.t())
           },
           meta: Surface.AST.Meta.t()
         }
@@ -566,7 +605,7 @@ defmodule Surface.AST do
           | AST.Expr.t()
           | AST.Tag.t()
           | AST.VoidTag.t()
-          | AST.Template.t()
+          | AST.SlotEntry.t()
           | AST.Slot.t()
           | AST.If.t()
           | AST.For.t()
@@ -598,6 +637,25 @@ defmodule Surface.AST do
         else
           {map, [attr | others]}
         end
+      end)
+
+    {map, Enum.reverse(others)}
+  end
+
+  def pop_attributes_as_map(attributes, names) do
+    initial = {Map.new(names, &{&1, nil}), []}
+
+    {map, others} =
+      Enum.reduce(attributes, initial, fn
+        %AST.Attribute{name: name} = attr, {map, others} ->
+          if name in names do
+            {Map.put(map, name, attr), others}
+          else
+            {map, [attr | others]}
+          end
+
+        attr, {map, others} ->
+          {map, [attr | others]}
       end)
 
     {map, Enum.reverse(others)}

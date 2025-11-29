@@ -1,15 +1,24 @@
 defmodule Surface.CompilerTest do
-  use ExUnit.Case
+  use Surface.ConnCase, async: true
+
+  import Surface, only: [sigil_F: 2]
+  import Phoenix.Component, only: [sigil_H: 2]
+  alias Phoenix.LiveView.Rendered
 
   defmodule Macro do
     use Surface.MacroComponent
 
-    def expand(_, _, meta) do
+    prop text, :string, required: true
+
+    def expand(attributes, _, meta) do
+      text = Surface.AST.find_attribute_value(attributes, :text).value
+      capitalized_text = String.capitalize(text)
+
       %Surface.AST.Tag{
         element: "div",
         directives: [],
         attributes: [],
-        children: ["I'm a macro"],
+        children: [capitalized_text],
         meta: meta
       }
     end
@@ -55,9 +64,9 @@ defmodule Surface.CompilerTest do
   defmodule Grid do
     use Surface.Component
 
-    prop items, :list
+    prop items, :generator
 
-    slot cols, args: [item: ^items]
+    slot cols, generator_prop: :items
 
     def render(assigns) do
       ~F"""
@@ -85,6 +94,93 @@ defmodule Surface.CompilerTest do
     def render(assigns) do
       ~F"""
       """
+    end
+  end
+
+  defp func(assigns) do
+    ~F[hello]
+  end
+
+  describe "set the root field for the %Phoenix.LiveView.Rendered{} struct" do
+    test "set it to `true` if the there's only a single root tag node" do
+      assigns = %{}
+
+      assert %Rendered{root: true} = ~H[<div/>]
+      assert %Rendered{root: true} = ~F[<div/>]
+      assert %Rendered{root: true} = ~H[<div><span>text</span></div>]
+      assert %Rendered{root: true} = ~F[<div><span>text</span></div>]
+      assert %Rendered{root: true} = ~H[<div><.func/></div>]
+      assert %Rendered{root: true} = ~F[<div><.func/></div>]
+      assert %Rendered{root: true} = ~H[<div><%= "text" %></div>]
+      assert %Rendered{root: true} = ~F[<div>{"text"}</div>]
+
+      assert %Rendered{root: true} = ~H[ <div>text</div> ]
+      assert %Rendered{root: true} = ~F[ <div>text</div> ]
+
+      assert %Rendered{root: true} = ~H"""
+             <div>text</div>
+             """
+
+      assert %Rendered{root: true} = ~F"""
+             <div>text</div>
+             """
+    end
+
+    test "set it to `false` if the root tag is translated/wrapped into an expression e.g. using `:for` or `:if`" do
+      assigns = %{}
+
+      assert %Rendered{root: false} = ~H[<div :if={true}/>]
+      assert %Rendered{root: false} = ~F[<div :if={true}/>]
+      assert %Rendered{root: false} = ~H(<div :for={_ <- []}/>)
+      assert %Rendered{root: false} = ~F(<div :for={_ <- []}/>)
+    end
+
+    test "set it to `false` if it's a text node" do
+      assigns = %{}
+
+      assert %Rendered{root: false} = ~H[text]
+      assert %Rendered{root: false} = ~F[text]
+    end
+
+    test "set it to `false` if it's an expression" do
+      assigns = %{}
+
+      assert %Rendered{root: false} = ~H[<%= "text" %>]
+      assert %Rendered{root: false} = ~F[{"text"}]
+    end
+
+    test "set it to `false` if it's a component" do
+      assigns = %{}
+
+      assert %Rendered{root: false} = ~H[<.func/>]
+      assert %Rendered{root: false} = ~F[<.func/>]
+    end
+
+    test "set it to `false` if there are multiple nodes" do
+      assigns = %{}
+
+      assert %Rendered{root: false} = ~H[<div/><div/>]
+      assert %Rendered{root: false} = ~F[<div/><div/>]
+
+      assert %Rendered{root: false} = ~H[text<div/>]
+      assert %Rendered{root: false} = ~F[text<div/>]
+
+      assert %Rendered{root: false} = ~H[<div/>text]
+      assert %Rendered{root: false} = ~F[<div/>text]
+
+      assert %Rendered{root: false} = ~H[<div/><%= "text" %>]
+      assert %Rendered{root: false} = ~F[<div/>{"text"}]
+
+      assert %Rendered{root: false} = ~H[<!-- comment --><div/>]
+      assert %Rendered{root: false} = ~F[<!-- comment --><div/>]
+
+      assert %Rendered{root: false} = ~H[<div/><!-- comment -->]
+      assert %Rendered{root: false} = ~F[<div/><!-- comment -->]
+
+      # Private comments are excluded from the AST.
+      # And since they are not available in ~H, we don't assert against it.
+      assert %Rendered{root: true} = ~F[{!-- comment --}<div/>]
+      assert %Rendered{root: true} = ~F[<div/>{!-- comment --}]
     end
   end
 
@@ -140,7 +236,7 @@ defmodule Surface.CompilerTest do
                  type: :string,
                  value: %Surface.AST.AttributeExpr{
                    original: "@label",
-                   value: {_, _, [_, _, [{:@, _, [{:label, _, _}]}], [], _, _]}
+                   value: {_, _, [_, _, [{:@, _, [{:label, _, _}]}], [], _, _, _]}
                  }
                }
              ]
@@ -235,8 +331,7 @@ defmodule Surface.CompilerTest do
              module: Surface.CompilerTest.Button,
              props: [
                %Surface.AST.Attribute{
-                 name: :label,
-                 type: :string,
+                 root: true,
                  value: %Surface.AST.AttributeExpr{
                    original: "\"click\""
                  }
@@ -394,7 +489,7 @@ defmodule Surface.CompilerTest do
            } = node
   end
 
-  test "LiveView's propeties are forwarded to live_render as options" do
+  test "LiveView's properties are forwarded to live_render as options" do
     code = """
     <MyLiveViewWith id="my_id" session={%{user_id: 1}} />
     """
@@ -462,39 +557,20 @@ defmodule Surface.CompilerTest do
   end
 
   describe "macro components" do
-    test "inject a __compile_dep__/0 macro call to force compile-time dependency" do
-      code = """
-      <#Macro />
-      """
-
-      [node | _] = Surface.Compiler.compile(code, 1, __ENV__)
-
-      assert %Surface.AST.Container{
-               children: [
-                 %Surface.AST.Expr{value: {{:., _, [{:require, _, _}, :__compile_dep__]}, _, []}},
-                 %Surface.AST.Tag{}
-               ]
-             } = node
-    end
-
     test "expanded at top level" do
       code = """
-      <#Macro />
+      <#Macro text="i'm a macro" />
       """
 
       [node | _] = Surface.Compiler.compile(code, 1, __ENV__)
 
-      assert %Surface.AST.Container{
-               children: [
-                 _,
-                 %Surface.AST.Tag{children: ["I'm a macro"], element: "div"}
-               ]
-             } = node
+      assert %Surface.AST.MacroComponent{children: [%Surface.AST.Tag{children: ["I'm a macro"], element: "div"}]} =
+               node
     end
 
     test "expanded within a component" do
       code = """
-      <Div><#Macro></#Macro></Div>
+      <Div><#Macro text="i'm a macro"></#Macro></Div>
       """
 
       [node | _] = Surface.Compiler.compile(code, 1, __ENV__)
@@ -502,13 +578,12 @@ defmodule Surface.CompilerTest do
       assert %Surface.AST.Component{
                module: Surface.CompilerTest.Div,
                props: [],
-               templates: %{
+               slot_entries: %{
                  default: [
-                   %Surface.AST.Template{
+                   %Surface.AST.SlotEntry{
                      children: [
-                       %Surface.AST.Container{
+                       %Surface.AST.MacroComponent{
                          children: [
-                           _,
                            %Surface.AST.Tag{
                              children: ["I'm a macro"],
                              element: "div"
@@ -524,7 +599,7 @@ defmodule Surface.CompilerTest do
 
     test "expanded within an html tag" do
       code = """
-      <div><#Macro /></div>
+      <div><#Macro text="i'm a macro"/></div>
       """
 
       [node | _] = Surface.Compiler.compile(code, 1, __ENV__)
@@ -532,14 +607,17 @@ defmodule Surface.CompilerTest do
       assert %Surface.AST.Tag{
                element: "div",
                children: [
-                 %Surface.AST.Container{
-                   children: [
-                     %Surface.AST.Expr{},
-                     %Surface.AST.Tag{children: ["I'm a macro"], element: "div"}
-                   ]
+                 %Surface.AST.MacroComponent{
+                   children: [%Surface.AST.Tag{children: ["I'm a macro"], element: "div"}]
                  }
                ]
              } = node
+    end
+
+    test "should render an error without required prop" do
+      code = "<#Macro />"
+      [node | _] = Surface.Compiler.compile(code, 1, __ENV__)
+      assert %Surface.AST.Error{directives: [], message: "cannot render <#Macro> (missing required props)"} = node
     end
   end
 
@@ -662,7 +740,7 @@ defmodule Surface.CompilerTest do
       </div>
       """
 
-      assert_raise(SyntaxError, "nofile:3: syntax error before: ','", fn ->
+      assert_raise(SyntaxError, ~r/nofile:3:/, fn ->
         Surface.Compiler.compile(code, 1, __ENV__)
       end)
     end
@@ -679,7 +757,7 @@ defmodule Surface.CompilerTest do
       </Grid>
       """
 
-      assert_raise(SyntaxError, "nofile:6: syntax error before: ','", fn ->
+      assert_raise(SyntaxError, ~r/nofile:6:/, fn ->
         Surface.Compiler.compile(code, 1, __ENV__)
       end)
     end
@@ -695,7 +773,7 @@ defmodule Surface.CompilerTest do
       </div>
       """
 
-      assert_raise(SyntaxError, "nofile:6: syntax error before: ','", fn ->
+      assert_raise(SyntaxError, ~r/nofile:6:/, fn ->
         Surface.Compiler.compile(code, 1, __ENV__)
       end)
     end
@@ -709,7 +787,7 @@ defmodule Surface.CompilerTest do
       </Grid>
       """
 
-      assert_raise(SyntaxError, "nofile:1: syntax error before: ','", fn ->
+      assert_raise(SyntaxError, ~r/nofile:1:/, fn ->
         Surface.Compiler.compile(code, 1, __ENV__)
       end)
     end
@@ -726,7 +804,7 @@ defmodule Surface.CompilerTest do
       </Grid>
       """
 
-      assert_raise(SyntaxError, "nofile:5: syntax error before: ','", fn ->
+      assert_raise(SyntaxError, ~r/nofile:5/, fn ->
         Surface.Compiler.compile(code, 1, __ENV__)
       end)
     end
@@ -740,15 +818,131 @@ defmodule Surface.CompilerTest do
       </GridLive>
       """
 
-      assert_raise(SyntaxError, "nofile:1: syntax error before: ','", fn ->
+      assert_raise(SyntaxError, ~r/nofile:1:/, fn ->
         Surface.Compiler.compile(code, 1, __ENV__)
       end)
+    end
+  end
+
+  describe "debug annotations" do
+    @describetag skip: not Surface.CompilerTest.DebugAnnotationsUtil.debug_heex_annotations_supported?()
+
+    test "show debug info for components with a single root tag" do
+      import Surface.CompilerTest.DebugAnnotations
+
+      html =
+        render_surface do
+          ~F"""
+          <div>
+            <Surface.CompilerTest.DebugAnnotations.func_with_tag/>
+          </div>
+          """
+        end
+
+      assert html == """
+             <div>
+               <!-- <Surface.CompilerTest.DebugAnnotations.func_with_tag> test/support/debug_annotations.exs:7 () --><div>func_with_tag</div><!-- </Surface.CompilerTest.DebugAnnotations.func_with_tag> -->
+             </div>
+             """
+    end
+
+    test "show debug info for components with multiple root tags" do
+      html =
+        render_surface do
+          ~F"""
+          <div>
+            <Surface.CompilerTest.DebugAnnotations.func_with_multiple_root_tags/>
+          </div>
+          """
+        end
+
+      assert html == """
+             <div>
+               <!-- <Surface.CompilerTest.DebugAnnotations.func_with_multiple_root_tags> test/support/debug_annotations.exs:21 () --><div>text 1</div><div>text 2</div><!-- </Surface.CompilerTest.DebugAnnotations.func_with_multiple_root_tags> -->
+             </div>
+             """
+    end
+
+    test "show debug info for components with text only" do
+      html =
+        render_surface do
+          ~F"""
+          <div>
+            <Surface.CompilerTest.DebugAnnotations.func_with_only_text/>
+          </div>
+          """
+        end
+
+      assert html == """
+             <div>
+               <!-- <Surface.CompilerTest.DebugAnnotations.func_with_only_text> test/support/debug_annotations.exs:11 () -->only_text<!-- </Surface.CompilerTest.DebugAnnotations.func_with_only_text> -->
+             </div>
+             """
+    end
+
+    test "show full namespace if the component is imported" do
+      import Surface.CompilerTest.DebugAnnotations
+
+      html =
+        render_surface do
+          ~F"""
+          <div>
+            <.func_with_tag/>
+          </div>
+          """
+        end
+
+      assert html == """
+             <div>
+               <!-- <Surface.CompilerTest.DebugAnnotations.func_with_tag> test/support/debug_annotations.exs:7 () --><div>func_with_tag</div><!-- </Surface.CompilerTest.DebugAnnotations.func_with_tag> -->
+             </div>
+             """
+    end
+
+    test "show debug info for module components with a colocated sface file and point to line 3" do
+      alias Surface.CompilerTest.DebugAnnotations
+
+      html =
+        render_surface do
+          ~F"""
+          <div>
+            <DebugAnnotations/>
+            <Surface.CompilerTest.DebugAnnotations/>
+          </div>
+          """
+        end
+
+      assert html == """
+             <div>
+               <!-- <Surface.CompilerTest.DebugAnnotations.render> test/support/debug_annotations.sface:3 () -->render<!-- </Surface.CompilerTest.DebugAnnotations.render> -->
+               <!-- <Surface.CompilerTest.DebugAnnotations.render> test/support/debug_annotations.sface:3 () -->render<!-- </Surface.CompilerTest.DebugAnnotations.render> -->
+             </div>
+             """
+    end
+
+    test "show debug info for component generated by embed_sface/1 and point to line 1" do
+      import Surface.CompilerTest.DebugAnnotations
+
+      html =
+        render_surface do
+          ~F"""
+          <div>
+            <.debug_annotations/>
+          </div>
+          """
+        end
+
+      assert html == """
+             <div>
+               <!-- <Surface.CompilerTest.DebugAnnotations.debug_annotations> test/support/debug_annotations.sface:1 () -->render<!-- </Surface.CompilerTest.DebugAnnotations.debug_annotations> -->
+             </div>
+             """
     end
   end
 end
 
 defmodule Surface.CompilerSyncTest do
-  use ExUnit.Case
+  use Surface.Case
 
   import ExUnit.CaptureIO
 
@@ -769,30 +963,69 @@ defmodule Surface.CompilerSyncTest do
     assert line == 2
   end
 
-  test "warning with hint when a unaliased component cannot be loaded" do
+  test "warning when a directive is specified multiple times in an HTML element" do
+    code = """
+    <div
+      :on-click="a"
+      :on-click="b"
+    ></div>
+    """
+
+    {:warn, line, message} = run_compile(code, __ENV__)
+
+    assert message =~ """
+           the directive `:on-click` has been passed multiple times. Considering only the last value.
+
+           Hint: remove all redundant definitions.
+
+             nofile:3:\
+           """
+
+    assert line == 3
+  end
+
+  test "warning when any directive is specified multiple times in an HTML element and not only events" do
+    code = """
+    <div
+      :if={true}
+      :if={true}
+      :on-click="a"
+    ></div>
+    """
+
+    {:warn, line, message} = run_compile(code, __ENV__)
+
+    assert message =~ """
+           the directive `:if` has been passed multiple times. Considering only the last value.
+
+           Hint: remove all redundant definitions.
+
+             nofile:3:\
+           """
+
+    assert line == 3
+  end
+
+  test "don't warn when directive is specified multiple times in components" do
+    code = ~s[<Button :props={"a"} :props={"b"} />]
+
+    assert {:ok, _component} = run_compile(code, __ENV__)
+  end
+
+  test "raise when a unaliased component cannot be loaded" do
     code = """
     <div>
       <But />
     </div>
     """
 
-    {:warn, line, message} = run_compile(code, __ENV__)
-
-    assert message =~ """
-           cannot render <But> (module But could not be loaded)
-
-           Hint: Make sure module `But` can be successfully compiled.
-
-           If the module is namespaced, you can use its full name. For instance:
-
-             <MyProject.Components.But>
-
-           or add a proper alias so you can use just `<But>`:
-
-             alias MyProject.Components.But
-           """
-
-    assert line == 2
+    assert_raise(
+      Surface.CompileError,
+      ~r/nofile:2(:4)?:\n#{maybe_ansi("error:")} cannot render <But> \(module But could not be loaded\)/,
+      fn ->
+        Surface.Compiler.compile(code, 1, __ENV__)
+      end
+    )
   end
 
   test "warning when module is not a component" do
@@ -808,22 +1041,6 @@ defmodule Surface.CompilerSyncTest do
 
     assert message =~ "cannot render <Chars> (module List.Chars is not a component)"
     assert line == 2
-  end
-
-  test "warning on non-existent property" do
-    code = """
-    <div>
-      <Button
-        label="test"
-        nonExistingProp="1"
-      />
-    </div>
-    """
-
-    {:warn, line, message} = run_compile(code, __ENV__)
-
-    assert message =~ ~S(Unknown property "nonExistingProp" for component <Button>)
-    assert line == 4
   end
 
   test "warning on undefined assign in property" do
@@ -848,42 +1065,6 @@ defmodule Surface.CompilerSyncTest do
 
     assert message =~ ~S(undefined assign `@assign`.)
     assert line == 2
-  end
-
-  test "warning on missing required property" do
-    code = """
-    <Column />
-    """
-
-    {:warn, line, message} = run_compile(code, __ENV__)
-
-    assert message =~ ~S(Missing required property "title" for component <Column>)
-    assert line == 1
-  end
-
-  test "warning on missing id for LiveComponent" do
-    code = """
-    <GridLive />
-    """
-
-    {:warn, line, message} = run_compile(code, __ENV__)
-
-    assert message =~ ~S"""
-           Missing required property "id" for component <GridLive>
-
-           Hint: Components using `Surface.LiveComponent` automatically define a required `id` prop to make them stateful.
-           If you meant to create a stateless component, you can switch to `use Surface.Component`.
-           """
-
-    assert line == 1
-  end
-
-  test "disable warning on missing required property when :props is passed" do
-    code = """
-    <Column :props={title: "My Title"}/>
-    """
-
-    assert {:ok, _result} = run_compile(code, __ENV__)
   end
 
   test "warning on stateful components with more than one root element" do
@@ -1070,6 +1251,29 @@ defmodule Surface.CompilerSyncTest do
     assert extract_line(output) == 6
   end
 
+  test "VoidTag is a valid HTML root element" do
+    id = :erlang.unique_integer([:positive]) |> to_string()
+
+    view_code = """
+    defmodule TestLiveComponent_#{id} do
+      use Surface.LiveComponent
+
+      def render(assigns) do
+        ~F"\""
+        <br />
+        "\""
+      end
+    end
+    """
+
+    output =
+      capture_io(:standard_error, fn ->
+        {{:module, _, _, _}, _} = Code.eval_string(view_code, [], %{__ENV__ | file: "code.exs", line: 1})
+      end)
+
+    refute output =~ "stateful live components must have a HTML root element"
+  end
+
   test "warning on component with required slot that has a default value" do
     id = :erlang.unique_integer([:positive]) |> to_string()
 
@@ -1085,8 +1289,8 @@ defmodule Surface.CompilerSyncTest do
         ~F"\""
         <div>
           <#slot>Default Content</#slot>
-          <#slot name="header">Default Header</#slot>
-          <#slot name="footer">Default Footer</#slot>
+          <#slot {@header}>Default Header</#slot>
+          <#slot {@footer}>Default Footer</#slot>
         </div>
         "\""
       end
@@ -1126,13 +1330,13 @@ defmodule Surface.CompilerSyncTest do
 
              slot header
              ...
-             <#slot name="header">Fallback content</#slot>
+             <#slot {@header}>Fallback content</#slot>
 
            or keep the slot as required and remove the fallback content:
 
              slot header, required: true`
              ...
-             <#slot name="header" />
+             <#slot {@header} />
 
            but not both.
 

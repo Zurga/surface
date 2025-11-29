@@ -26,7 +26,7 @@ defmodule Surface.Directive.For do
 
   defp handle_modifiers([{:<-, clause_meta, [var, list]}], ["with_index" | modifiers], meta) do
     udpated_list =
-      quote generated: true do
+      quote do
         Enum.with_index(unquote(list))
       end
 
@@ -35,7 +35,7 @@ defmodule Surface.Directive.For do
 
   defp handle_modifiers([{:<-, clause_meta, [var, list]}], ["index" | modifiers], meta) do
     udpated_list =
-      quote generated: true do
+      quote do
         Enum.scan(unquote(list), -1, fn _, a -> a + 1 end)
       end
 
@@ -44,12 +44,12 @@ defmodule Surface.Directive.For do
 
   defp handle_modifiers([{_, clause_meta, _} = list], ["index" | modifiers], meta) do
     var =
-      quote generated: true do
+      quote do
         var!(index)
       end
 
     udpated_list =
-      quote generated: true do
+      quote do
         Enum.scan(unquote(list), -1, fn _, a -> a + 1 end)
       end
 

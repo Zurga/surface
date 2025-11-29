@@ -35,11 +35,15 @@ defmodule Surface.API do
     :regex,
     :uri,
     :path,
-    # Private
     :generator,
+    # Private
     :context_put,
-    :context_get
+    :context_get,
+    :dynamic
   ]
+
+  @enum_types Surface.Compiler.Variants.enum_types()
+  @choice_types Surface.Compiler.Variants.choice_types()
 
   defmacro __using__(include: include) do
     arities = %{
@@ -59,9 +63,6 @@ defmodule Surface.API do
       # Any caller component can hold other components with slots
       Module.register_attribute(__MODULE__, :assigned_slots_by_parent, accumulate: false)
 
-      Module.register_attribute(__MODULE__, :changes_context?, accumulate: true)
-      Module.register_attribute(__MODULE__, :gets_context?, accumulate: true)
-
       for func <- unquote(include) do
         Module.register_attribute(__MODULE__, func, accumulate: true)
       end
@@ -74,13 +75,11 @@ defmodule Surface.API do
     [
       quoted_prop_funcs(env),
       quoted_slot_funcs(env),
-      quoted_data_funcs(env),
-      quoted_context_funcs(env)
+      quoted_data_funcs(env)
     ]
   end
 
   def __after_compile__(env, _) do
-    validate_assigns!(env)
     validate_duplicated_assigns!(env)
     validate_slot_props_bindings!(env)
     validate_duplicate_root_props!(env)
@@ -139,6 +138,10 @@ defmodule Surface.API do
       opts_ast: opts_ast,
       line: line
     }
+
+    # We cannot wait to validate this in __after_compile__ as template compilation,
+    # e.g. `~F`, may need to access the assign's spec before that.
+    validate_assign!(assign, caller)
 
     Module.put_attribute(caller.module, :assigns, assign)
     Module.put_attribute(caller.module, assign.func, assign)
@@ -227,7 +230,6 @@ defmodule Surface.API do
       |> get_props()
       |> sort_props()
 
-    props_names = for p <- props, do: p.name
     props_by_name = for p <- props, into: %{}, do: {p.name, p}
     required_props_names = for %{name: name, opts: opts} <- props, opts[:required], do: name
 
@@ -235,11 +237,6 @@ defmodule Surface.API do
       @doc false
       def __props__() do
         unquote(Macro.escape(props))
-      end
-
-      @doc false
-      def __validate_prop__(prop) do
-        prop in unquote(props_names)
       end
 
       @doc false
@@ -269,7 +266,7 @@ defmodule Surface.API do
     quote do
       @doc false
       def __slots__() do
-        unquote(Macro.escape(slots))
+        unquote(slots |> Enum.reverse() |> Macro.escape())
       end
 
       @doc false
@@ -291,56 +288,6 @@ defmodule Surface.API do
       def __required_slots_names__() do
         unquote(Macro.escape(required_slots_names))
       end
-    end
-  end
-
-  defp quoted_context_funcs(env) do
-    funs_changing =
-      env.module
-      |> Module.get_attribute(:changes_context?, [])
-      |> MapSet.new()
-
-    funs_getting =
-      env.module
-      |> Module.get_attribute(:gets_context?, [])
-      |> MapSet.new()
-
-    quoted_changing =
-      for fun <- funs_changing do
-        quote do
-          @doc false
-          def __changes_context__?(unquote(fun)), do: true
-        end
-      end
-
-    quoted_changing_fallback =
-      quote do
-        @doc false
-        def __changes_context__?(_fun), do: false
-      end
-
-    quoted_getting =
-      for fun <- funs_getting do
-        quote do
-          @doc false
-          def __gets_context__?(unquote(fun)), do: true
-        end
-      end
-
-    quoted_getting_fallback =
-      quote do
-        @doc false
-        def __gets_context__?(_fun), do: false
-      end
-
-    List.flatten([quoted_changing, quoted_changing_fallback, quoted_getting, quoted_getting_fallback])
-  end
-
-  defp validate_assigns!(env) do
-    assigns = Module.get_attribute(env.module, :assigns, [])
-
-    for assign <- assigns do
-      validate_assign!(assign, env)
     end
   end
 
@@ -435,37 +382,44 @@ defmodule Surface.API do
     end)
   end
 
+  defp get_valid_opts(:prop, :generator, _opts) do
+    [:required, :root]
+  end
+
   defp get_valid_opts(:prop, _type, _opts) do
-    [:required, :default, :values, :values!, :accumulate, :root, :static]
+    [:required, :default, :values, :values!, :accumulate, :root, :static, :from_context, :css_variant]
   end
 
   defp get_valid_opts(:data, _type, _opts) do
-    [:default, :values, :values!]
+    [:default, :values, :values!, :from_context, :css_variant]
   end
 
   defp get_valid_opts(:slot, _type, _opts) do
-    [:required, :args, :as]
-  end
-
-  defp validate_opt_ast!(:slot, :args, args_ast, caller) do
-    Enum.map(args_ast, fn
-      {name, {:^, _, [{generator, _, context}]}} when context in [Elixir, nil] ->
-        Macro.escape(%{name: name, generator: generator})
-
-      name when is_atom(name) ->
-        Macro.escape(%{name: name, generator: nil})
-
-      ast ->
-        message =
-          "invalid slot argument #{Macro.to_string(ast)}. " <>
-            "Expected an atom or a binding to a generator as `key: ^property_name`"
-
-        IOHelper.compile_error(message, caller.file, caller.line)
-    end)
+    [:required, :arg, :as, :generator_prop]
   end
 
   defp validate_opt_ast!(_func, _key, value, _caller) do
     value
+  end
+
+  defp validate_opt(_func, _name, type, opts, :css_variant, value, _line, _env) do
+    values? = (opts[:values] || opts[:values!] || []) != []
+
+    if is_boolean(value) or
+         (Keyword.keyword?(value) and
+            Enum.all?(value, fn {k, v} -> css_variant_opt_valid?(type, k, v, values?) end)) do
+      :ok
+    else
+      message = """
+      invalid value for :css_variant. Expected either a boolean or a keyword list of options, got: #{inspect(value)}.
+
+      Valid options for type #{inspect(type)} are:
+
+      #{valid_opts_for_css_variant(type, values?)}\
+      """
+
+      {:error, message}
+    end
   end
 
   defp validate_opt(:prop, _name, _type, _opts, :root, value, _line, _env)
@@ -481,6 +435,41 @@ defmodule Surface.API do
   defp validate_opt(_func, _name, _type, _opts, :required, value, _line, _env)
        when not is_boolean(value) do
     {:error, "invalid value for option :required. Expected a boolean, got: #{inspect(value)}"}
+  end
+
+  defp validate_opt(_func, _name, _type, _opts, :css_variant, value, _line, _env)
+       when not is_boolean(value) do
+    {:error, "invalid value for option :css_variant. Expected a boolean, got: #{inspect(value)}"}
+  end
+
+  defp validate_opt(_func, _name, _type, opts, :from_context, value, _line, env) do
+    cond do
+      Module.get_attribute(env.module, :component_type) == Surface.LiveView ->
+        {:error, "option :from_context is not supported for Surface.Liveview"}
+
+      Keyword.has_key?(opts, :default) ->
+        {:error, "using option :from_context along with :default is currently not allowed"}
+
+      true ->
+        case value do
+          {scope, key} when is_atom(scope) and is_atom(key) ->
+            :ok
+
+          key when is_atom(key) ->
+            :ok
+
+          _ ->
+            message = """
+            invalid value for option :from_context.
+
+            Expected: a `key when is_atom(key)` or a tuple `{scope, key} when is_atom(scope) and is_atom(key)`.
+
+            Got: #{inspect(value)}
+            """
+
+            {:error, message}
+        end
+    end
   end
 
   defp validate_opt(:prop, name, _type, opts, :default, value, line, env) do
@@ -516,38 +505,6 @@ defmodule Surface.API do
   defp validate_opt(:slot, _name, _type, _opts, :as, value, _line, _caller)
        when not is_atom(value) do
     {:error, "invalid value for option :as in slot. Expected an atom, got: #{inspect(value)}"}
-  end
-
-  defp validate_opt(:slot, :default, _type, _opts, :args, value, line, env) do
-    if Module.defines?(env.module, {:__slot_name__, 0}) do
-      slot_name = Module.get_attribute(env.module, :__slot_name__)
-
-      prop_example =
-        value
-        |> Enum.map(fn %{name: name} -> "#{name}: #{name}" end)
-        |> Enum.join(", ")
-
-      component_name = Macro.to_string(env.module)
-
-      message = """
-      arguments for the default slot in a slotable component are not accessible - instead the arguments \
-      from the parent's #{slot_name} slot will be exposed via `:let={...}`.
-
-      Hint: You can remove these arguments, pull them up to the parent component, or make this component not slotable \
-      and use it inside an explicit template element:
-      ```
-      <#template name="#{slot_name}">
-        <#{component_name} :let={#{prop_example}}>
-          ...
-        </#{component_name}>
-      </#template>
-      ```
-      """
-
-      IOHelper.warn(message, env, line)
-    end
-
-    :ok
   end
 
   defp validate_opt(_func, _name, _type, _opts, _key, _value, _line, _env) do
@@ -613,7 +570,7 @@ defmodule Surface.API do
   defp format_opts(opts_ast) do
     opts_ast
     |> Macro.to_string()
-    |> String.slice(1..-2)
+    |> String.slice(1..-2//1)
   end
 
   defp generate_docs(env) do
@@ -699,30 +656,34 @@ defmodule Surface.API do
     end
   end
 
+  defp available_generators_hint(module) do
+    existing_generators_names = module.__props__() |> Enum.filter(&(&1.type == :generator)) |> Enum.map(& &1.name)
+
+    "Available generators are #{inspect(existing_generators_names)}"
+  end
+
   defp validate_slot_props_bindings!(env) do
     for slot <- env.module.__slots__(),
-        slot_props = Keyword.get(slot.opts, :args, []),
-        %{name: name, generator: generator} <- slot_props,
-        generator != nil do
+        generator = Keyword.get(slot.opts, :generator_prop) do
       case env.module.__get_prop__(generator) do
         nil ->
-          existing_properties_names = env.module.__props__() |> Enum.map(& &1.name)
-
           message = """
-          cannot bind slot argument `#{name}` to property `#{generator}`. \
-          Expected an existing property after `^`, \
+          cannot use property `#{generator}` as generator for slot. \
+          Expected an existing property of type `:generator`, \
           got: an undefined property `#{generator}`.
 
-          Hint: Available properties are #{inspect(existing_properties_names)}\
+          Hint: #{available_generators_hint(env.module)}\
           """
 
           IOHelper.compile_error(message, env.file, slot.line)
 
-        %{type: type} when type != :list ->
+        %{type: type} when type != :generator ->
           message = """
-          cannot bind slot argument `#{name}` to property `#{generator}`. \
-          Expected a property of type :list after `^`, \
-          got: a property of type #{inspect(type)}\
+          cannot use property `#{generator}` as generator for slot. \
+          Expected a property of type :generator, \
+          got: a property of type #{inspect(type)}
+
+          Hint: #{available_generators_hint(env.module)}\
           """
 
           IOHelper.compile_error(message, env.file, slot.line)
@@ -759,5 +720,63 @@ defmodule Surface.API do
           ] do
       Surface.API.put_assign(__ENV__, func, name, type, opts, opts_ast, line)
     end
+  end
+
+  defp valid_opts_for_css_variant(:boolean, _) do
+    """
+      * :true - the name of the variant when the value is `true`. Default is the assign name.
+      * :false - the name of the variant when the value is `false` or `nil`. Default is `not-[assign-name]`.
+    """
+  end
+
+  defp valid_opts_for_css_variant(type, _) when type in @enum_types do
+    """
+      * :has_items - the name of the variant when the value list has items. Default is `has-[assign-name]`
+      * :no_items - the name of the variant when the value is empty or `nil`. Default is `no-[assign-name]`
+    """
+  end
+
+  defp valid_opts_for_css_variant(_, true = _values?) do
+    """
+      * :prefix - the prefix of the variant name for each value listed in `values` or `values!`. Default is `[assign-name]-`.
+    """
+  end
+
+  defp valid_opts_for_css_variant(type, _) do
+    values_message =
+      if type in @choice_types do
+        """
+
+        or, if you use the `values` or `values!` options:
+
+        #{valid_opts_for_css_variant(type, true)}\
+        """
+      end
+
+    """
+      * :not_nil - the name of the variant when the value is not `nil`. Default is the assign name.
+      * :nil - the name of the variant when the value is `nil`. Default is `no-[assign-name]`.
+    #{values_message}\
+    """
+  end
+
+  defp css_variant_opt_valid?(_type, _opt, opt_value, _values?) when not is_binary(opt_value) do
+    false
+  end
+
+  defp css_variant_opt_valid?(:boolean, opt_name, _opt_value, _values?) do
+    opt_name in [true, false]
+  end
+
+  defp css_variant_opt_valid?(type, opt_name, _opt_value, _values?) when type in [:list, :map, :mapset, :range] do
+    opt_name in [:has_items, :no_items]
+  end
+
+  defp css_variant_opt_valid?(_type, opt_name, _opt_value, true = _values?) do
+    opt_name == :prefix
+  end
+
+  defp css_variant_opt_valid?(_type, opt_name, _opt_value, _values?) do
+    opt_name in [nil, :not_nil]
   end
 end

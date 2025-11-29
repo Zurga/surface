@@ -2,6 +2,7 @@ defmodule Surface.TypeHandler do
   @moduledoc false
 
   alias Surface.IOHelper
+  alias Surface.Components.Dynamic
 
   @type clauses :: list(Macro.t())
   @type opts :: keyword(Macro.t())
@@ -25,7 +26,7 @@ defmodule Surface.TypeHandler do
               original :: String.t()
             ) :: {:ok, Macro.t()} | {:error, String.t()} | :error
 
-  @callback expr_to_value(clauses :: list(), opts :: keyword()) ::
+  @callback expr_to_value(clauses :: list(), opts :: keyword(), ctx :: map()) ::
               {:ok, any()} | {:error, any()} | {:error, any(), String.t()}
 
   @callback value_to_html(name :: atom(), value :: any()) ::
@@ -34,15 +35,12 @@ defmodule Surface.TypeHandler do
   @callback value_to_opts(name :: atom(), value :: any()) ::
               {:ok, any()} | {:error, String.t()}
 
-  @callback update_prop_expr(expr :: Macro.t(), meta :: Surface.AST.Meta.t()) :: Macro.t()
-
   @optional_callbacks [
     literal_to_ast_node: 4,
     expr_to_quoted: 6,
-    expr_to_value: 2,
+    expr_to_value: 3,
     value_to_html: 2,
-    value_to_opts: 2,
-    update_prop_expr: 2
+    value_to_opts: 2
   ]
 
   @boolean_tag_attributes [
@@ -81,28 +79,27 @@ defmodule Surface.TypeHandler do
       @behaviour unquote(__MODULE__)
       @default_handler unquote(__MODULE__).Default
 
-      @impl true
-      defdelegate literal_to_ast_node(type, name, value, meta), to: @default_handler
+      if __MODULE__ != @default_handler do
+        @impl true
+        defdelegate literal_to_ast_node(type, name, value, meta), to: @default_handler
 
-      @impl true
-      defdelegate expr_to_quoted(type, name, clauses, opts, module, original),
-        to: @default_handler
+        @impl true
+        defdelegate expr_to_quoted(type, name, clauses, opts, module, original),
+          to: @default_handler
 
-      @impl true
-      defdelegate expr_to_value(clauses, opts), to: @default_handler
-      @impl true
-      defdelegate value_to_html(name, value), to: @default_handler
-      @impl true
-      defdelegate value_to_opts(name, value), to: @default_handler
-      @impl true
-      defdelegate update_prop_expr(expr, meta), to: @default_handler
+        @impl true
+        defdelegate expr_to_value(clauses, opts, ctx), to: @default_handler
+        @impl true
+        defdelegate value_to_html(name, value), to: @default_handler
+        @impl true
+        defdelegate value_to_opts(name, value), to: @default_handler
 
-      defoverridable literal_to_ast_node: 4,
-                     expr_to_quoted: 6,
-                     expr_to_value: 2,
-                     value_to_html: 2,
-                     value_to_opts: 2,
-                     update_prop_expr: 2
+        defoverridable literal_to_ast_node: 4,
+                       expr_to_quoted: 6,
+                       expr_to_value: 3,
+                       value_to_html: 2,
+                       value_to_opts: 2
+      end
     end
   end
 
@@ -149,8 +146,8 @@ defmodule Surface.TypeHandler do
     end
   end
 
-  def expr_to_value!(type, name, clauses, opts, module, original) do
-    case handler(type).expr_to_value(clauses, opts) do
+  def expr_to_value!(type, name, clauses, opts, module, original, ctx) do
+    case handler(type).expr_to_value(clauses, opts, ctx) do
       {:ok, value} ->
         value
 
@@ -180,7 +177,12 @@ defmodule Surface.TypeHandler do
         {:ok, [~S( ), to_string(name)]}
 
       {:ok, val} ->
-        {:ok, Phoenix.HTML.Tag.attributes_escape([{name, val}])}
+        attr_value =
+          [{name, val}]
+          |> Phoenix.HTML.attributes_escape()
+          |> Phoenix.HTML.safe_to_string()
+
+        {:ok, attr_value}
 
       {:error, message} ->
         {:error, message}
@@ -195,25 +197,57 @@ defmodule Surface.TypeHandler do
       {:ok, val} ->
         [{name, val}]
 
+      {:ok, :value, ""} ->
+        [{:value, ""}]
+
       {:error, message} ->
         IOHelper.runtime_error(message)
     end
   end
 
-  def update_prop_expr(type, value, meta) do
-    handler(type).update_prop_expr(value, meta)
-  end
+  def runtime_prop_value!(module, name, clauses, opts, node_alias, original, ctx) do
+    caller = %Macro.Env{module: ctx.module}
 
-  def runtime_prop_value!(module, name, value, node_alias) do
-    type =
+    {type, type_opts} =
       attribute_type_and_opts(module, name, %{
+        runtime: true,
         node_alias: node_alias || module,
-        caller: __ENV__,
-        file: __ENV__.file,
-        line: __ENV__.line
+        caller: caller,
+        file: ctx.file,
+        line: ctx.line
       })
 
-    expr_to_value!(type, name, [value], [], module, value)
+    if Keyword.get(type_opts, :accumulate, false) do
+      Enum.map(clauses, &expr_to_value!(type, name, [&1], opts, module, original, ctx))
+    else
+      if length(clauses) > 1 do
+        message =
+          if Keyword.get(type_opts, :root, false) do
+            """
+            the prop `#{name}` has been passed multiple times. Considering only the last value.
+
+            Hint: Either specify the `#{name}` via the root property (`<#{node_alias} { ... }>`) or \
+            explicitly via the #{name} property (`<#{node_alias} #{name}="...">`), but not both.
+            """
+          else
+            """
+            the prop `#{name}` has been passed multiple times. Considering only the last value.
+
+            Hint: Either remove all redundant definitions or set option `accumulate` to `true`:
+
+            ```
+              prop #{name}, #{inspect(type)}, accumulate: true
+            ```
+
+            This way the values will be accumulated in a list.
+            """
+          end
+
+        IOHelper.warn(message, caller, ctx.file, ctx.line)
+      end
+
+      expr_to_value!(type, name, [List.last(clauses)], opts, module, original, ctx)
+    end
   end
 
   def attribute_type_and_opts(name) do
@@ -232,44 +266,54 @@ defmodule Surface.TypeHandler do
 
   def attribute_type_and_opts(nil, _name, _meta), do: {:string, []}
 
-  def attribute_type_and_opts(Surface.Components.Dynamic.Component, _name, _meta) do
-    # TODO: If we add a property to define the list of available modules
-    # we could go through the list and validate/retrieve the types and opts
-    {:any, []}
+  # TODO: If we add a property to define the list of available modules or create
+  # the concept of interfaces, we could validate/retrieve the types and opts.
+  def attribute_type_and_opts(Dynamic.Component, :module, _meta) do
+    {:module, []}
   end
 
-  def attribute_type_and_opts(Surface.Components.Dynamic.LiveComponent, _name, _meta) do
-    # TODO: If we add a property to define the list of available modules
-    # we could go through the list and validate/retrieve the types and opts
-    {:any, []}
+  def attribute_type_and_opts(Dynamic.Component, :function, _meta) do
+    {:atom, []}
   end
 
-  def attribute_type_and_opts(module, name, meta) do
+  def attribute_type_and_opts(Dynamic.Component, _name, _meta) do
+    {:dynamic, []}
+  end
+
+  def attribute_type_and_opts(Dynamic.LiveComponent, :module, _meta) do
+    {:module, []}
+  end
+
+  def attribute_type_and_opts(Dynamic.LiveComponent, _name, _meta) do
+    {:dynamic, []}
+  end
+
+  def attribute_type_and_opts(_, :__caller_scope_id__, _meta) do
+    {:string, []}
+  end
+
+  def attribute_type_and_opts(module, name, _meta) do
     with true <- function_exported?(module, :__get_prop__, 1),
          prop when not is_nil(prop) <- module.__get_prop__(name) do
       {prop.type, prop.opts}
     else
       _ ->
-        IOHelper.warn(
-          "Unknown property \"#{to_string(name)}\" for component <#{meta.node_alias}>",
-          meta.caller,
-          meta.file,
-          meta.line
-        )
-
         {:string, []}
     end
   end
 
   defp runtime_error_message(type, name, value, module, original, details \\ nil) do
+    name = name || Enum.find(module.__props__(), & &1.opts[:root]).name
+
     details = if details, do: "\n" <> details, else: details
     {attr_name, attr_kind} = formatted_name_and_kind(name, module)
+
+    original_expr_msg = if original, do: "\nOriginal expression: {#{original}}", else: ""
 
     """
     invalid value for #{attr_kind} #{attr_name}. \
     Expected a #{inspect(type)}, got: #{inspect(value)}.
-
-    Original expression: {#{original}}
+    #{original_expr_msg}
     #{details}\
     """
   end
@@ -290,6 +334,8 @@ defmodule Surface.TypeHandler do
         {name, "directive"}
 
       module ->
+        name = name || Enum.find(module.__props__(), & &1.opts[:root]).name
+
         {inspect("#{name}"), "property"}
 
       true ->
@@ -330,17 +376,18 @@ defmodule Surface.TypeHandler do
   defp handler(:form), do: __MODULE__.Form
   defp handler(:map), do: __MODULE__.Map
   defp handler(:keyword), do: __MODULE__.Keyword
-  defp handler(:explict_keyword), do: __MODULE__.ExplicitKeyword
   defp handler(:css_class), do: __MODULE__.CssClass
   defp handler(:style), do: __MODULE__.Style
   defp handler(:event), do: __MODULE__.Event
   defp handler(:phx_event), do: __MODULE__.PhxEvent
   defp handler(:generator), do: __MODULE__.Generator
-  defp handler(:bindings), do: __MODULE__.Bindings
   defp handler(:list), do: __MODULE__.List
   defp handler(:static_list), do: __MODULE__.StaticList
   defp handler(:context_put), do: __MODULE__.ContextPut
   defp handler(:context_get), do: __MODULE__.ContextGet
   defp handler(:hook), do: __MODULE__.Hook
+  defp handler(:dynamic), do: __MODULE__.Dynamic
+  defp handler(:let_arg), do: __MODULE__.LetArg
+  defp handler(:render_slot), do: __MODULE__.RenderSlot
   defp handler(_), do: __MODULE__.Default
 end

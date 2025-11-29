@@ -25,7 +25,7 @@ defmodule Surface.Components.LinkTest do
     def render(assigns) do
       ~F"""
       <div>
-        <Link label="user" to="/users/1" capture_click="my_click" />
+        <Link label="user" to="/users/1" click="my_click" />
       </div>
       """
     end
@@ -136,15 +136,15 @@ defmodule Surface.Components.LinkTest do
     end
 
     test "link with %URI{}" do
-      url = "https://surface-ui.org/"
+      assigns = %{url: "https://surface-ui.org/"}
 
-      assert render_surface(do: ~F[<Link label="elixir" to={url} />]) ==
-               render_surface(do: ~F[<Link label="elixir" to={URI.parse(url)} />])
+      assert render_surface(do: ~F[<Link label="elixir" to={@url} />]) ==
+               render_surface(do: ~F[<Link label="elixir" to={URI.parse(@url)} />])
 
-      path = "/surface"
+      assigns = %{path: "/surface"}
 
-      assert render_surface(do: ~F[<Link label="elixir" to={path} />]) ==
-               render_surface(do: ~F[<Link label="elixir" to={URI.parse(path)} />])
+      assert render_surface(do: ~F[<Link label="elixir" to={@path} />]) ==
+               render_surface(do: ~F[<Link label="elixir" to={URI.parse(@path)} />])
     end
 
     test "link with put/delete" do
@@ -173,23 +173,6 @@ defmodule Surface.Components.LinkTest do
                ~s[<a data-method="put" data-to="/world" rel="nofollow" href="/world">hello</a>]
     end
 
-    test "link with :do contents" do
-      html =
-        render_surface do
-          ~F"""
-          <Link to="/hello">
-            {Phoenix.HTML.Tag.content_tag(:p, "world")}
-          </Link>
-          """
-        end
-
-      assert html == """
-             <a href="/hello">
-               <p>world</p>
-             </a>
-             """
-    end
-
     test "link with scheme" do
       html = render_surface(do: ~F[<Link label="foo" to="/javascript:alert(<1>)" />])
       assert html =~ ~s[<a href="/javascript:alert(&lt;1&gt;)">foo</a>]
@@ -201,19 +184,19 @@ defmodule Surface.Components.LinkTest do
       html = render_surface(do: ~F[<Link label="foo" to={{:javascript, "alert(<1>)"}} />])
       assert html =~ ~s[<a href="javascript:alert(&lt;1&gt;)">foo</a>]
 
-      html = render_surface(do: ~F[<Link label="foo" to={{:javascript, 'alert(<1>)'}} />])
+      html = render_surface(do: ~F[<Link label="foo" to={{:javascript, ~c"alert(<1>)"}} />])
       assert html =~ ~s[<a href="javascript:alert(&lt;1&gt;)">foo</a>]
 
       html = render_surface(do: ~F[<Link label="foo" to={{:javascript, {:safe, "alert(<1>)"}}} />])
 
       assert html =~ ~s[<a href="javascript:alert(<1>)">foo</a>]
 
-      html = render_surface(do: ~F[<Link label="foo" to={{:javascript, {:safe, 'alert(<1>)'}}} />])
+      html = render_surface(do: ~F[<Link label="foo" to={{:javascript, {:safe, ~c"alert(<1>)"}}} />])
 
       assert html =~ ~s[<a href="javascript:alert(<1>)">foo</a>]
     end
 
-    test "link with invalid args" do
+    test "link with invalid arg" do
       msg = "<Link /> requires a label prop or contents in the default slot"
 
       assert_raise ArgumentError, msg, fn ->
@@ -229,7 +212,7 @@ defmodule Surface.Components.LinkTest do
       end
 
       assert_raise ArgumentError, ~r"unsupported scheme given to <Link />", fn ->
-        render_surface(do: ~F[<Link label="foo" to={{:safe, 'javascript:alert(<1>)'}} />])
+        render_surface(do: ~F[<Link label="foo" to={{:safe, ~c"javascript:alert(<1>)"}} />])
       end
     end
   end

@@ -1,4 +1,5 @@
 defmodule Surface.Compiler.ParseTreeTranslator do
+  @moduledoc false
   @behaviour Surface.Compiler.NodeTranslator
 
   alias Surface.IOHelper
@@ -86,7 +87,7 @@ defmodule Surface.Compiler.ParseTreeTranslator do
           message = """
           cannot pass dynamic attributes to <#slot>.
 
-          Slots only accept `name`, `index`, `:args`, `:if` and `:for`.
+          Slots only accept the root prop, `for`, `name`, `index`, `generator_value`, `:if` and `:for`.
           """
 
           IOHelper.compile_error(message, attr_meta.file, attr_meta.line)
@@ -108,7 +109,11 @@ defmodule Surface.Compiler.ParseTreeTranslator do
         _state,
         _context
       ) do
-    {:expr, value, _expr_meta} = expr
+    value =
+      case expr do
+        {:expr, value, _expr_meta} -> value
+        nil -> ""
+      end
 
     message = """
     cannot assign `{...#{value}}` to attribute `#{name}`. \

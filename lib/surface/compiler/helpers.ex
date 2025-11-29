@@ -1,11 +1,13 @@
 defmodule Surface.Compiler.Helpers do
+  @moduledoc false
   alias Surface.AST
   alias Surface.Compiler.CompileMeta
   alias Surface.IOHelper
 
   @builtin_common_assigns [
     :__context__,
-    :__surface__
+    :__caller_scope_id__,
+    :streams
   ]
 
   @builtin_component_assigns [:inner_block] ++ @builtin_common_assigns
@@ -20,6 +22,8 @@ defmodule Surface.Compiler.Helpers do
     Surface.LiveComponent => @builtin_live_component_assigns,
     Surface.LiveView => @builtin_live_view_assigns
   }
+
+  @env Mix.env()
 
   def builtin_assigns_by_type(type) do
     @builtin_assigns_by_type[type]
@@ -58,7 +62,7 @@ defmodule Surface.Compiler.Helpers do
     defined_assigns =
       caller.module
       |> Surface.API.get_assigns()
-      |> Enum.map(& &1.name)
+      |> Enum.map(&(&1[:opts][:as] || &1.name))
 
     builtin_assigns = builtin_assigns_by_type(component_type)
     undefined_assigns = Keyword.drop(used_assigns, builtin_assigns ++ defined_assigns)
@@ -101,13 +105,15 @@ defmodule Surface.Compiler.Helpers do
     assigns
   end
 
-  def to_meta(tree_meta, %CompileMeta{caller: caller, checks: checks}) do
+  def to_meta(tree_meta, %CompileMeta{caller: caller, checks: checks, style: style, caller_spec: caller_spec}) do
     %AST.Meta{
       line: tree_meta.line,
       column: tree_meta.column,
       file: tree_meta.file,
       caller: caller,
-      checks: checks
+      checks: checks,
+      style: style,
+      caller_spec: caller_spec
     }
   end
 
@@ -128,16 +134,18 @@ defmodule Surface.Compiler.Helpers do
     ""
   end
 
-  def list_to_string(singular, _plural, [item]) do
-    "#{singular} #{inspect(item)}"
+  def list_to_string(singular, plural, items, map_fun \\ &inspect/1)
+
+  def list_to_string(singular, _plural, [item], map_fun) do
+    "#{singular} #{map_fun.(item)}"
   end
 
-  def list_to_string(_singular, plural, items) do
-    [last | rest] = items |> Enum.map(&inspect/1) |> Enum.reverse()
+  def list_to_string(_singular, plural, items, map_fun) do
+    [last | rest] = items |> Enum.map(map_fun) |> Enum.reverse()
     "#{plural} #{rest |> Enum.reverse() |> Enum.join(", ")} and #{last}"
   end
 
-  @blanks ' \n\r\t\v\b\f\e\d\a'
+  @blanks ~c" \n\r\t\v\b\f\e\d\a"
 
   def blank?([]), do: true
 
@@ -154,7 +162,7 @@ defmodule Surface.Compiler.Helpers do
   def is_blank_or_empty(%AST.Literal{value: value}),
     do: blank?(value)
 
-  def is_blank_or_empty(%AST.Template{children: children}),
+  def is_blank_or_empty(%AST.SlotEntry{children: children}),
     do: Enum.all?(children, &is_blank_or_empty/1)
 
   def is_blank_or_empty(_node), do: false
@@ -200,6 +208,34 @@ defmodule Surface.Compiler.Helpers do
         else
           {:component, mod, nil}
         end
+    end
+  end
+
+  # TODO: remove this function and use the `caller_spec` field on the `CompileMeta` struct instead
+  def get_module_attribute(module, key, default) do
+    if @env == :test do
+      # If the template is compiled directly in a test module, get_attribute might fail,
+      # breaking some of the tests once in a while.
+      try do
+        Module.get_attribute(module, key, default)
+      rescue
+        _e in ArgumentError -> default
+      end
+    else
+      Module.get_attribute(module, key, default)
+    end
+  end
+
+  def is_stateful_component(module) do
+    cond do
+      function_exported?(module, :component_type, 0) ->
+        module.component_type() == Surface.LiveComponent
+
+      Module.open?(module) ->
+        get_module_attribute(module, :component_type, false) == Surface.LiveComponent
+
+      true ->
+        false
     end
   end
 
@@ -255,7 +291,7 @@ defmodule Surface.Compiler.Helpers do
 
   defp hint_for_unloaded_module(node_alias) do
     """
-    Hint: Make sure module `#{node_alias}` can be successfully compiled.
+    make sure module `#{node_alias}` can be successfully compiled.
 
     If the module is namespaced, you can use its full name. For instance:
 

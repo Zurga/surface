@@ -39,16 +39,16 @@ defmodule Surface.ComponentTest do
     end
   end
 
-  defmodule OuterWithSlotArgs do
+  defmodule OuterWithSlotArg do
     use Surface.Component
 
-    slot default, args: [:info]
+    slot default, arg: %{info: :string}
 
     def render(assigns) do
       info = "My info"
 
       ~F"""
-      <div><#slot :args={info: info}/></div>
+      <div><#slot {@default, info: info}/></div>
       """
     end
   end
@@ -75,14 +75,14 @@ defmodule Surface.ComponentTest do
     end
   end
 
-  defmodule ViewWithSlotArgs do
+  defmodule ViewWithSlotArg do
     use Surface.LiveView
 
     def render(assigns) do
       ~F"""
-      <OuterWithSlotArgs :let={info: my_info}>
+      <OuterWithSlotArg :let={info: my_info}>
         {my_info}
-      </OuterWithSlotArgs>
+      </OuterWithSlotArg>
       """
     end
   end
@@ -144,11 +144,18 @@ defmodule Surface.ComponentTest do
 
     prop list, :list
     prop count, :integer, default: 1
+    data item, :any
+    data rest, :list
 
     def render(%{list: [item | rest]} = assigns) do
+      assigns =
+        assigns
+        |> assign(:item, item)
+        |> assign(:rest, rest)
+
       ~F"""
-      {@count}. {item}
-      <Recursive list={rest} count={@count + 1}/>
+      {@count}. {@item}
+      <Recursive list={@rest} count={@count + 1}/>
       """
     end
 
@@ -201,9 +208,10 @@ defmodule Surface.ComponentTest do
     end
     """
 
-    message = "code.exs:2: invalid value for option :slot. Expected a string, got: {1, 2}"
+    message =
+      ~r"code.exs:2:\n#{maybe_ansi("error:")} invalid value for option :slot. Expected a string, got: {1, 2}"
 
-    assert_raise(CompileError, message, fn ->
+    assert_raise(Surface.CompileError, message, fn ->
       {{:module, _, _, _}, _} = Code.eval_string(code, [], %{__ENV__ | file: "code.exs", line: 1})
     end)
   end
@@ -243,8 +251,8 @@ defmodule Surface.ComponentTest do
              """
     end
 
-    test "render content with slot args" do
-      {:ok, _view, html} = live_isolated(build_conn(), ViewWithSlotArgs)
+    test "render content with slot arg" do
+      {:ok, _view, html} = live_isolated(build_conn(), ViewWithSlotArg)
 
       assert html =~ """
              <div>
@@ -287,13 +295,13 @@ defmodule Surface.ComponentTest do
              """
     end
 
-    test "render content with slot args" do
+    test "render content with slot arg" do
       html =
         render_surface do
           ~F"""
-          <OuterWithSlotArgs :let={info: my_info}>
+          <OuterWithSlotArg :let={info: my_info}>
             {my_info}
-          </OuterWithSlotArgs>
+          </OuterWithSlotArg>
           """
         end
 
@@ -328,16 +336,14 @@ defmodule Surface.ComponentTest do
                  """
         end)
 
-      assert output =~ ~r"""
-             cannot render <Enum> \(module Enum is not a component\)
-               code:2:\
-             """
+      assert output =~ "cannot render <Enum> (module Enum is not a component)"
+      assert output =~ "code:2:"
     end
   end
 
   describe "components in dead views" do
     defmodule DeadView do
-      use Phoenix.View, root: "support/dead_views"
+      use Phoenix.Template, root: "support/dead_views"
       import Surface
 
       def render("index.html", assigns) do
@@ -348,7 +354,7 @@ defmodule Surface.ComponentTest do
     end
 
     test "renders the component" do
-      assert Phoenix.View.render_to_string(DeadView, "index.html", []) =~
+      assert Phoenix.Template.render_to_string(DeadView, "index", "html", []) =~
                """
                <div><div class="myclass">
                  <span>My label</span>
@@ -356,5 +362,53 @@ defmodule Surface.ComponentTest do
                </div>
                """
     end
+  end
+
+  defmodule ComponentWithoutCompileTimeDeps do
+    use Surface.Component
+
+    def render(assigns) do
+      ~F"""
+      <Stateless label="My label" class="myclass"/>
+      <Outer>
+        <Inner/>
+      </Outer>
+      """
+    end
+
+    def __compile_time_deps__() do
+      Enum.reverse(@__compile_time_deps__)
+    end
+  end
+
+  defmodule ComponentWithCompileTimeDeps do
+    use Surface.Component
+
+    use Surface.ComponentTest.Stateless
+    use Surface.ComponentTest.Outer, as: AliasedOuter
+    use Inner
+
+    def render(assigns) do
+      ~F"""
+      <Stateless label="My label" class="myclass"/>
+      <AliasedOuter>
+        <Inner/>
+      </AliasedOuter>
+      """
+    end
+
+    def __compile_time_deps__() do
+      Enum.reverse(@__compile_time_deps__)
+    end
+  end
+
+  test "component with compile-time deps" do
+    assert ComponentWithoutCompileTimeDeps.__compile_time_deps__() == []
+
+    assert ComponentWithCompileTimeDeps.__compile_time_deps__() == [
+             Surface.ComponentTest.Stateless,
+             Surface.ComponentTest.Outer,
+             Surface.ComponentTest.Inner
+           ]
   end
 end

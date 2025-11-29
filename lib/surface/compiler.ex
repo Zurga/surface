@@ -9,10 +9,7 @@ defmodule Surface.Compiler do
   alias Surface.IOHelper
   alias Surface.AST
   alias Surface.Compiler.Helpers
-
-  @stateful_component_types [
-    Surface.LiveComponent
-  ]
+  alias Surface.Compiler.CSSTranslator
 
   @tag_directive_handlers [
     Surface.Directive.TagAttrs,
@@ -39,15 +36,14 @@ defmodule Surface.Compiler do
     Surface.Directive.Debug
   ]
 
-  @template_directive_handlers [Surface.Directive.Let]
+  @slot_entry_directive_handlers [Surface.Directive.Let]
 
   @slot_directive_handlers [
-    Surface.Directive.SlotArgs,
     Surface.Directive.If,
     Surface.Directive.For
   ]
 
-  @valid_slot_props ["name", "index"]
+  @valid_slot_props [:root, "generator_value", "context_put"]
 
   @directive_prefixes [":", "s-"]
 
@@ -70,15 +66,41 @@ defmodule Surface.Compiler do
     "wbr"
   ]
 
+  # TODO: Add all relevant information from the caller (when it's a component), e.g. props, data, style, etc.
+  # Make the compiler use this struct instead of calls to Surface.API.*(caller.module)
+  defmodule CallerSpec do
+    defstruct type: nil,
+              props: [],
+              variants: [],
+              data_variants: [],
+              requires_s_self_on_root?: false,
+              requires_s_scope_on_root?: false,
+              has_style_or_variants?: false,
+              scope_id: nil
+
+    @type t :: %__MODULE__{
+            type: module(),
+            props: list(),
+            variants: list(),
+            data_variants: list(),
+            requires_s_self_on_root?: boolean(),
+            requires_s_scope_on_root?: boolean(),
+            has_style_or_variants?: boolean(),
+            scope_id: binary()
+          }
+  end
+
   defmodule CompileMeta do
-    defstruct [:line, :file, :caller, :checks, :variables]
+    defstruct [:line, :file, :caller, :checks, :variables, :module, :style, :caller_spec]
 
     @type t :: %__MODULE__{
             line: non_neg_integer(),
             file: binary(),
             caller: Macro.Env.t(),
             variables: keyword(),
-            checks: Keyword.t(boolean())
+            checks: Keyword.t(boolean()),
+            caller_spec: CallerSpec.t(),
+            style: map()
           }
   end
 
@@ -93,26 +115,82 @@ defmodule Surface.Compiler do
           Surface.AST.t()
         ]
   def compile(string, line, caller, file \\ "nofile", opts \\ []) do
+    tokens =
+      Parser.parse!(string,
+        file: file,
+        line: line,
+        caller: caller,
+        checks: opts[:checks] || [],
+        warnings: opts[:warnings] || [],
+        column: Keyword.get(opts, :column, 1),
+        indentation: Keyword.get(opts, :indentation, 0)
+      )
+
+    {style, tokens} =
+      tokens
+      |> skip_blanks()
+      |> maybe_pop_style(caller, [file: file, line: line] ++ opts)
+
+    caller_spec = build_caller_spec(caller, style)
+
     compile_meta = %CompileMeta{
       line: line,
       file: file,
       caller: caller,
       checks: opts[:checks] || [],
-      variables: opts[:variables]
+      variables: opts[:variables],
+      style: style,
+      caller_spec: caller_spec
     }
 
-    string
-    |> Parser.parse!(
-      file: file,
-      line: line,
-      caller: caller,
-      checks: opts[:checks] || [],
-      warnings: opts[:warnings] || [],
-      column: Keyword.get(opts, :column, 1),
-      indentation: Keyword.get(opts, :indentation, 0)
-    )
+    tokens
+    |> skip_blanks()
     |> to_ast(compile_meta)
+    |> maybe_transform_ast(compile_meta)
     |> validate_component_structure(compile_meta, caller.module)
+  end
+
+  defp build_caller_spec(caller, style) do
+    component_type =
+      if Module.open?(caller.module) do
+        Module.get_attribute(caller.module, :component_type)
+      end
+
+    use_deep_at_the_beginning? = Map.get(style, :use_deep_at_the_beginning?, false)
+
+    caller_spec = %CallerSpec{
+      type: component_type,
+      scope_id: style.scope_id,
+      requires_s_self_on_root?: use_deep_at_the_beginning?,
+      requires_s_scope_on_root?: use_deep_at_the_beginning?,
+      has_style_or_variants?: Map.has_key?(style, :css)
+    }
+
+    if component_type do
+      # Currently, we only support props and data for the module components
+      {props, datas} =
+        if caller.function == {:render, 1} do
+          {Surface.API.get_props(caller.module), Surface.API.get_data(caller.module)}
+        else
+          {[], []}
+        end
+
+      {variants, data_variants} = Surface.Compiler.Variants.generate(props ++ datas)
+
+      define_variants? = variants != []
+
+      %CallerSpec{
+        caller_spec
+        | props: props,
+          variants: variants,
+          data_variants: data_variants,
+          requires_s_self_on_root?: caller_spec.requires_s_self_on_root? or define_variants?,
+          requires_s_scope_on_root?: caller_spec.requires_s_scope_on_root? or define_variants?,
+          has_style_or_variants?: caller_spec.has_style_or_variants? or define_variants?
+      }
+    else
+      caller_spec
+    end
   end
 
   def to_live_struct(nodes, opts \\ []) do
@@ -120,30 +198,11 @@ defmodule Surface.Compiler do
   end
 
   def validate_component_structure(ast, meta, module) do
-    if is_stateful_component(module) do
+    if Helpers.is_stateful_component(module) do
       validate_stateful_component(ast, meta)
     end
 
     ast
-  end
-
-  defp is_stateful_component(module) do
-    cond do
-      function_exported?(module, :component_type, 0) ->
-        module.component_type() in @stateful_component_types
-
-      Module.open?(module) ->
-        # If the template is compiled directly in a test module, get_attribute might fail,
-        # breaking some of the tests once in a while.
-        try do
-          Module.get_attribute(module, :component_type) in @stateful_component_types
-        rescue
-          _e in ArgumentError -> false
-        end
-
-      true ->
-        false
-    end
   end
 
   defp validate_stateful_component(ast, %CompileMeta{caller: %{function: {:render, _}}} = compile_meta) do
@@ -224,23 +283,23 @@ defmodule Surface.Compiler do
         {:ok, ast} ->
           process_directives(ast)
 
-        {:error, {message, line}, meta} ->
-          IOHelper.warn(message, compile_meta.caller, meta.file, line)
+        {:error, {message, line, column}, meta} ->
+          IOHelper.warn(message, compile_meta.caller, meta.file, {line, column})
           %AST.Error{message: message, meta: meta}
 
-        {:error, {message, details, line}, meta} ->
-          details = if details, do: "\n\n" <> details, else: ""
-          IOHelper.warn(message <> details, compile_meta.caller, meta.file, line)
+        {:error, {message, details, line, column}, meta} ->
+          # TODO: turn it back as a warning when using @after_verify in Elixir >= 0.14.
+          # Make sure to check if the genarated `require <component>.__info__()` doesn't get called,
+          # raising Elixir's CompileError.
+          IOHelper.compile_error(message, details, meta.file, {line, column})
           %AST.Error{message: message, meta: meta}
       end
     end
   end
 
   # Slots
-  defp node_type({"#template", _, _, _}), do: :template
   defp node_type({"#slot", _, _, _}), do: :slot
-  defp node_type({":" <> _, _, _, _}), do: :template
-  defp node_type({"slot", _, _, _}), do: :slot
+  defp node_type({":" <> _, _, _, _}), do: :slot_entry
 
   # Conditional blocks
   defp node_type({:block, "if", _, _, _}), do: :if_elseif_else
@@ -275,14 +334,36 @@ defmodule Surface.Compiler do
   defp node_type(_), do: :text
 
   defp process_directives(%{directives: directives} = node) when is_list(directives) do
+    node_is_tag? = match?(%AST.Tag{}, node)
+
+    {directives, _} =
+      for %AST.Directive{module: mod, meta: meta} = directive <- directives,
+          function_exported?(mod, :process, 2),
+          reduce: {node, MapSet.new()} do
+        {node, processed_directives} ->
+          if node_is_tag? and MapSet.member?(processed_directives, directive.name) do
+            message = """
+            the directive `:#{format_directive_name(directive.name)}` has been passed multiple times. Considering only the last value.
+
+            Hint: remove all redundant definitions.
+            """
+
+            IOHelper.warn(message, meta.caller, meta.file, meta.line)
+          end
+
+          {mod.process(directive, node), MapSet.put(processed_directives, directive.name)}
+      end
+
     directives
-    |> Enum.filter(fn %AST.Directive{module: mod} -> function_exported?(mod, :process, 2) end)
-    |> Enum.reduce(node, fn %AST.Directive{module: mod} = directive, node ->
-      mod.process(directive, node)
-    end)
   end
 
   defp process_directives(node), do: node
+
+  defp format_directive_name(directive_name) do
+    if to_string(directive_name) in Surface.Directive.Events.names(),
+      do: "on-#{directive_name}",
+      else: directive_name
+  end
 
   defp convert_node_to_ast(:comment, {_, _comment, %{visibility: :private}}, _), do: :ignore
 
@@ -443,22 +524,24 @@ defmodule Surface.Compiler do
     end
   end
 
-  defp convert_node_to_ast(:template, {name, attributes, children, node_meta}, compile_meta) do
+  defp convert_node_to_ast(:slot_entry, {name, attributes, children, node_meta}, compile_meta) do
     meta = Helpers.to_meta(node_meta, compile_meta)
 
     with {:ok, directives, attributes} <-
-           collect_directives(@template_directive_handlers, attributes, meta),
-         slot <- get_slot_name(name, attributes) do
+           collect_directives(@slot_entry_directive_handlers, attributes, meta),
+         slot <- get_slot_name(name, attributes),
+         attributes <- process_attributes(nil, attributes, meta, compile_meta) do
       {:ok,
-       %AST.Template{
+       %AST.SlotEntry{
          name: slot,
          children: to_ast(children, compile_meta),
+         props: attributes,
          directives: directives,
-         let: [],
+         let: nil,
          meta: meta
        }}
     else
-      _ -> {:error, {"failed to parse template", meta.line}, meta}
+      _ -> {:error, {"failed to parse slot entry", meta.line}, meta}
     end
   end
 
@@ -483,38 +566,101 @@ defmodule Surface.Compiler do
         ]
       end
 
-    # TODO: Validate attributes with custom messages
-    name = attribute_value(attributes, "name", :default)
-    short_slot_syntax? = not has_attribute?(attributes, "name")
+    has_root? = has_attribute?(attributes, :root)
+    name = extract_name_from_root(attributes)
 
-    index = attribute_value_as_ast(attributes, "index", %Surface.AST.Literal{value: 0}, compile_meta)
+    name =
+      if !name and !has_root? do
+        :default
+      else
+        name
+      end
 
-    with {:ok, directives, attrs} <-
-           collect_directives(@slot_directive_handlers, attributes, meta),
-         slot <- Enum.find(defined_slots, fn slot -> slot.name == name end),
-         slot when not is_nil(slot) <- slot do
-      maybe_warn_required_slot_with_default_value(slot, children, short_slot_syntax?, meta)
-      validate_slot_attrs!(attrs)
+    default_syntax? = not has_root?
 
-      {:ok,
-       %AST.Slot{
-         name: name,
-         index: index,
-         directives: directives,
-         default: to_ast(children, compile_meta),
-         args: [],
-         meta: meta
-       }}
-    else
-      _ ->
-        raise_missing_slot_error!(
-          meta.caller.module,
-          name,
-          meta,
-          defined_slots,
-          short_slot_syntax?
-        )
+    render_slot_args =
+      if has_root? do
+        attribute_value_as_ast(attributes, :root, :render_slot, %Surface.AST.Literal{value: nil}, compile_meta)
+      end
+
+    slot_entry_ast =
+      if has_root? do
+        render_slot_args.slot
+      end
+
+    {:ok, directives, attrs} = collect_directives(@slot_directive_handlers, attributes, meta)
+    validate_slot_attrs!(attrs, meta.caller)
+
+    slot =
+      Enum.find(defined_slots, fn slot ->
+        slot.name == name || (Keyword.has_key?(slot.opts, :as) and slot.opts[:as] == name)
+      end)
+
+    arg =
+      if has_root? do
+        render_slot_args.argument
+      else
+        nil
+      end
+
+    if slot do
+      maybe_warn_required_slot_with_default_value(
+        slot,
+        children,
+        slot_entry_ast,
+        meta
+      )
+
+      maybe_warn_argument_for_default_slot_in_slotable_component(slot, arg, meta)
     end
+
+    if name && !slot do
+      raise_missing_slot_error!(
+        meta.caller.module,
+        name,
+        meta,
+        defined_slots,
+        default_syntax?
+      )
+    end
+
+    generator_value =
+      cond do
+        has_attribute?(attributes, "generator_value") ->
+          attribute_value_as_ast(
+            attributes,
+            "generator_value",
+            :any,
+            %Surface.AST.Literal{value: nil},
+            compile_meta
+          )
+
+        slot && Keyword.has_key?(slot.opts, :generator_prop) ->
+          IOHelper.compile_error("`generator_value` is missing for slot `#{slot.name}`", meta.file, meta.line)
+
+        true ->
+          nil
+      end
+
+    context_put =
+      for {"context_put", {:attribute_expr, value, expr_meta}, _attr_meta} <- attributes do
+        expr_meta = Helpers.to_meta(expr_meta, meta)
+        expr = Surface.TypeHandler.expr_to_quoted!(value, "context_put", :context_put, expr_meta)
+        AST.AttributeExpr.new(expr, value, expr_meta)
+      end
+
+    {:ok,
+     %AST.Slot{
+       name: name,
+       as: if(slot, do: slot[:opts][:as]),
+       for: slot_entry_ast,
+       directives: directives,
+       default: to_ast(children, compile_meta),
+       arg: arg,
+       generator_value: generator_value,
+       context_put: context_put,
+       meta: meta
+     }}
   end
 
   defp convert_node_to_ast(:tag, {name, attributes, children, node_meta}, compile_meta) do
@@ -526,14 +672,18 @@ defmodule Surface.Compiler do
          children <- to_ast(children, compile_meta),
          :ok <- validate_tag_children(children) do
       {:ok,
-       %AST.Tag{
-         element: name,
-         attributes: attributes,
-         directives: directives,
-         children: children,
-         meta: meta
-       }}
+       maybe_transform_tag(
+         %AST.Tag{
+           element: name,
+           attributes: attributes,
+           directives: directives,
+           children: children,
+           meta: meta
+         },
+         compile_meta
+       )}
     else
+      {:error, message, meta} -> handle_convert_node_to_ast_error(name, {:error, message}, meta)
       error -> handle_convert_node_to_ast_error(name, error, meta)
     end
   end
@@ -547,12 +697,15 @@ defmodule Surface.Compiler do
          # a void element containing content is an error
          [] <- to_ast(children, compile_meta) do
       {:ok,
-       %AST.VoidTag{
-         element: name,
-         attributes: attributes,
-         directives: directives,
-         meta: meta
-       }}
+       maybe_transform_tag(
+         %AST.VoidTag{
+           element: name,
+           attributes: attributes,
+           directives: directives,
+           meta: meta
+         },
+         compile_meta
+       )}
     else
       error -> handle_convert_node_to_ast_error(name, error, meta)
     end
@@ -564,9 +717,9 @@ defmodule Surface.Compiler do
     meta =
       node_meta
       |> Helpers.to_meta(compile_meta)
-      |> Map.merge(%{module: mod, node_alias: name, function_component?: true})
+      |> Map.merge(%{module: mod, node_alias: name})
 
-    with {:ok, templates, attributes} <- collect_templates(mod, attributes, children, meta),
+    with {:ok, slot_entries, attributes} <- collect_slot_entries(mod, attributes, children, meta),
          {:ok, directives, attributes} <- collect_directives(@component_directive_handlers, attributes, meta),
          attributes <- process_attributes(nil, attributes, meta, compile_meta) do
       ast = %AST.FunctionComponent{
@@ -575,18 +728,18 @@ defmodule Surface.Compiler do
         type: type,
         props: attributes,
         directives: directives,
-        templates: templates,
+        slot_entries: slot_entries,
         meta: meta
       }
 
-      {:ok, ast}
+      {:ok, maybe_transform_component_ast(ast, compile_meta)}
     else
       error -> handle_convert_node_to_ast_error(name, error, meta)
     end
   end
 
   # Recursive components must be represented as function components
-  # until we can validate templates and properties of open modules
+  # until we can validate slot entries and properties of open modules
   defp convert_node_to_ast(:recursive_component, node, compile_meta) do
     {name, attributes, children, %{decomposed_tag: {_, mod, _}} = node_meta} = node
 
@@ -595,15 +748,15 @@ defmodule Surface.Compiler do
       |> Helpers.to_meta(compile_meta)
       |> Map.merge(%{module: mod, node_alias: name})
 
-    # TODO: we should call validate_templates/3 and validate_properties/4 validate
+    # TODO: we should call validate_slot_entries/3 validate
     # based on the module attributes since the module is still open
     with component_type <- Module.get_attribute(mod, :component_type),
          true <- component_type != nil,
          # This is a little bit hacky. :let will only be extracted for the default
-         # template if `mod` doesn't export __slot_name__ (i.e. if it isn't a slotable component)
+         # slot entry if `mod` doesn't export __slot_name__ (i.e. if it isn't a slotable component)
          # we pass in and modify the attributes so that non-slotable components are not
          # processed by the :let directive
-         {:ok, templates, attributes} <- collect_templates(mod, attributes, children, meta),
+         {:ok, slot_entries, attributes} <- collect_slot_entries(mod, attributes, children, meta),
          {:ok, directives, attributes} <- collect_directives(@component_directive_handlers, attributes, meta),
          attributes <- process_attributes(nil, attributes, meta, compile_meta) do
       ast = %AST.FunctionComponent{
@@ -612,11 +765,11 @@ defmodule Surface.Compiler do
         type: :remote,
         props: attributes,
         directives: directives,
-        templates: templates,
+        slot_entries: slot_entries,
         meta: meta
       }
 
-      {:ok, maybe_call_transform(ast)}
+      {:ok, maybe_transform_component_ast(ast, compile_meta)}
     else
       error -> handle_convert_node_to_ast_error(name, error, meta)
     end
@@ -634,24 +787,23 @@ defmodule Surface.Compiler do
          true <- function_exported?(mod, :component_type, 0),
          component_type <- mod.component_type(),
          # This is a little bit hacky. :let will only be extracted for the default
-         # template if `mod` doesn't export __slot_name__ (i.e. if it isn't a slotable component)
+         # slot entry if `mod` doesn't export __slot_name__ (i.e. if it isn't a slotable component)
          # we pass in and modify the attributes so that non-slotable components are not
          # processed by the :let directive
-         {:ok, templates, attributes} <- collect_templates(mod, attributes, children, meta),
-         :ok <- validate_templates(mod, templates, meta),
+         {:ok, slot_entries, attributes} <- collect_slot_entries(mod, attributes, children, meta),
+         :ok <- validate_slot_entries(mod, slot_entries, meta),
          {:ok, directives, attributes} <- collect_directives(@component_directive_handlers, attributes, meta),
-         attributes <- process_attributes(mod, attributes, meta, compile_meta),
-         :ok <- validate_properties(mod, attributes, directives, meta) do
+         attributes <- process_attributes(mod, attributes, meta, compile_meta) do
       result =
         if component_slotable?(mod) do
           %AST.SlotableComponent{
             module: mod,
             slot: mod.__slot_name__(),
             type: component_type,
-            let: [],
+            let: nil,
             props: attributes,
             directives: directives,
-            templates: templates,
+            slot_entries: slot_entries,
             meta: meta
           }
         else
@@ -660,48 +812,67 @@ defmodule Surface.Compiler do
             type: component_type,
             props: attributes,
             directives: directives,
-            templates: templates,
+            slot_entries: slot_entries,
             meta: meta
           }
         end
 
-      {:ok, maybe_call_transform(result)}
+      {:ok, maybe_transform_component_ast(result, compile_meta)}
     else
       error -> handle_convert_node_to_ast_error(name, error, meta)
     end
   end
 
-  defp convert_node_to_ast(:macro_component, {"#" <> name, attributes, children, node_meta}, compile_meta) do
+  defp convert_node_to_ast(
+         :macro_component,
+         {"#" <> name = node_alias, attributes, children, node_meta},
+         compile_meta
+       ) do
     meta = Helpers.to_meta(node_meta, compile_meta)
     mod = Helpers.actual_component_module!(name, meta.caller)
-    meta = Map.merge(meta, %{module: mod, node_alias: name})
+    meta = Map.merge(meta, %{module: mod, node_alias: node_alias})
 
     with :ok <- Helpers.validate_component_module(mod, name),
-         meta <- Map.merge(meta, %{module: mod, node_alias: name}),
+         meta <- Map.merge(meta, %{module: mod, node_alias: node_alias}),
          true <- function_exported?(mod, :expand, 3),
          {:ok, directives, attributes} <-
            collect_directives(@meta_component_directive_handlers, attributes, meta),
-         attributes <- process_attributes(mod, attributes, meta, compile_meta),
-         :ok <- validate_properties(mod, attributes, directives, meta) do
-      compile_dep_expr = %AST.Expr{
-        value:
-          quote generated: true, line: meta.line do
-            require(unquote(mod)).__compile_dep__()
-          end,
-        meta: meta
-      }
+         attributes <- process_attributes(mod, attributes, meta, compile_meta) do
+      case validate_properties(mod, attributes) do
+        :ok ->
+          expanded_children = mod.expand(attributes, List.to_string(children), meta)
 
-      expanded_children = mod.expand(attributes, List.to_string(children), meta)
-      children_with_dep = [compile_dep_expr | List.wrap(expanded_children)]
+          {:ok,
+           %AST.MacroComponent{
+             attributes: attributes,
+             children: List.wrap(expanded_children),
+             directives: directives,
+             meta: meta
+           }}
 
-      {:ok, %AST.Container{children: children_with_dep, directives: directives, meta: meta}}
+        :missing_required_props ->
+          message = "cannot render <#{node_alias}> (missing required props)"
+          {:ok, %AST.Error{attributes: attributes, message: message, meta: meta}}
+      end
     else
       false ->
-        {:error, {"cannot render <#{name}> (MacroComponents must export an expand/3 function)", meta.line}, meta}
+        {:error,
+         {"cannot render <#{node_alias}> (MacroComponents must export an expand/3 function)", meta.line,
+          meta.column}, meta}
 
       error ->
-        handle_convert_node_to_ast_error(name, error, meta)
+        handle_convert_node_to_ast_error(node_alias, error, meta)
     end
+  end
+
+  defp maybe_transform_component_ast(%AST.FunctionComponent{} = node, compile_meta) do
+    maybe_add_caller_scope_id_prop(node, compile_meta)
+  end
+
+  defp maybe_transform_component_ast(node, compile_meta) do
+    node
+    |> maybe_call_transform()
+    |> maybe_add_caller_scope_id_prop(compile_meta)
   end
 
   defp maybe_call_transform(%{module: module} = node) do
@@ -712,12 +883,93 @@ defmodule Surface.Compiler do
     end
   end
 
-  defp attribute_value(attributes, attr_name, default) do
-    Enum.find_value(attributes, default, fn {name, value, _} ->
-      if name == attr_name do
-        String.to_atom(value)
+  defp maybe_add_caller_scope_id_prop(node, %mod{caller_spec: %{has_style_or_variants?: true} = caller_spec})
+       when mod in [CompileMeta, AST.Meta] do
+    %{meta: meta, props: props} = node
+    %CallerSpec{scope_id: scope_id} = caller_spec
+
+    prop = %AST.Attribute{
+      meta: meta,
+      name: :__caller_scope_id__,
+      type: :string,
+      value: %AST.Literal{value: scope_id}
+    }
+
+    %{node | props: [prop | props]}
+  end
+
+  defp maybe_add_caller_scope_id_prop(node, _compile_meta) do
+    node
+  end
+
+  defp maybe_add_caller_scope_id_attr_to_root_node(%type{} = node, %CallerSpec{} = caller_spec)
+       when type in [AST.Tag, AST.VoidTag] do
+    is_caller_a_component? = caller_spec.type != nil
+
+    # TODO: when support for `attr` is added, check for :css_class types instead
+    function_component? = node.meta.caller.function != {:render, 1}
+
+    has_css_class_prop? = fn ->
+      Enum.any?(caller_spec.props, &(&1.type == :css_class))
+    end
+
+    passing_class_expr? = fn node ->
+      class = AST.find_attribute_value(node.attributes, :class)
+      match?(%AST.AttributeExpr{}, class)
+    end
+
+    attributes =
+      if is_caller_a_component? and passing_class_expr?.(node) and (has_css_class_prop?.() or function_component?) do
+        prefix = CSSTranslator.scope_attr_prefix()
+        # Quoted expression for ["the-prefix-#{@__caller_scope_id__}": !!@__caller_scope_id__]
+        expr =
+          quote do
+            [
+              "#{unquote(prefix)}#{var!(assigns)[:__caller_scope_id__]}":
+                {{:boolean, []}, !!var!(assigns)[:__caller_scope_id__]}
+            ]
+          end
+
+        data_caller_scope_id_attr = %AST.DynamicAttribute{
+          meta: node.meta,
+          expr: AST.AttributeExpr.new(expr, "", node.meta)
+        }
+
+        [data_caller_scope_id_attr | node.attributes]
+      else
+        node.attributes
       end
+
+    %{node | attributes: attributes}
+  end
+
+  defp maybe_add_caller_scope_id_attr_to_root_node(node, _caller_spec) do
+    node
+  end
+
+  defp attribute_raw_value(attributes, attr_name, default) do
+    Enum.find_value(attributes, default, fn
+      {^attr_name, {:attribute_expr, expr, _}, _} ->
+        expr
+
+      _ ->
+        nil
     end)
+  end
+
+  defp extract_name_from_root(attributes) do
+    with value when is_binary(value) <- attribute_raw_value(attributes, :root, nil),
+         {:ok, [{:@, _, [{assign_name, _, _}]} | _rest]} <-
+           Code.string_to_quoted("[#{value}]") do
+      assign_name
+    else
+      {:error, _} ->
+        # TODO: raise
+        nil
+
+      _ ->
+        nil
+    end
   end
 
   defp has_attribute?([], _), do: false
@@ -731,7 +983,16 @@ defmodule Surface.Compiler do
         expr_meta = Helpers.to_meta(expr_meta, meta)
         expr = Surface.TypeHandler.expr_to_quoted!(value, attr_name, type, expr_meta)
 
-        AST.AttributeExpr.new(expr, value, expr_meta)
+        if type == :render_slot do
+          %{slot: slot, argument: argument} = expr
+
+          %{
+            slot: AST.AttributeExpr.new(slot, value, expr_meta),
+            argument: AST.AttributeExpr.new(argument, value, expr_meta)
+          }
+        else
+          AST.AttributeExpr.new(expr, value, expr_meta)
+        end
 
       {^attr_name, value, attr_meta} ->
         attr_meta = Helpers.to_meta(attr_meta, meta)
@@ -750,7 +1011,6 @@ defmodule Surface.Compiler do
     nil
   end
 
-  defp get_slot_name("#template", attributes), do: attribute_value(attributes, "slot", :default)
   defp get_slot_name(":" <> name, _), do: String.to_atom(name)
 
   defp component_slotable?(mod), do: function_exported?(mod, :__slot_name__, 0)
@@ -767,21 +1027,25 @@ defmodule Surface.Compiler do
   end
 
   defp process_attributes(mod, [{:root, value, attr_meta} | attrs], meta, compile_meta, acc) do
-    with true <- function_exported?(mod, :__props__, 0),
-         prop when not is_nil(prop) <- Enum.find(mod.__props__(), & &1.opts[:root]) do
-      name = Atom.to_string(prop.name)
-      process_attributes(mod, [{name, value, attr_meta} | attrs], meta, compile_meta, acc)
-    else
-      _ ->
-        message = """
-        no root property defined for component <#{meta.node_alias}>
+    attr_meta = Helpers.to_meta(attr_meta, meta)
+    name = nil
 
-        Hint: you can declare a root property using option `root: true`
-        """
+    {ast_name, type} =
+      with true <- function_exported?(mod, :__props__, 0),
+           prop when not is_nil(prop) <- Enum.find(mod.__props__(), & &1.opts[:root]) do
+        {prop.name, prop.type}
+      else
+        _ -> {nil, nil}
+      end
 
-        IOHelper.warn(message, meta.caller, attr_meta.file, attr_meta.line)
-        process_attributes(mod, attrs, meta, compile_meta, acc)
-    end
+    node = %AST.Attribute{
+      root: true,
+      name: ast_name,
+      value: attr_value(name, type, value, attr_meta, compile_meta),
+      meta: attr_meta
+    }
+
+    process_attributes(mod, attrs, meta, compile_meta, [{name, node} | acc])
   end
 
   defp process_attributes(mod, [{name, value, attr_meta} | attrs], meta, compile_meta, acc) do
@@ -790,48 +1054,17 @@ defmodule Surface.Compiler do
     {type, type_opts} = Surface.TypeHandler.attribute_type_and_opts(mod, name, attr_meta)
 
     duplicated_attr? = Keyword.has_key?(acc, name)
-    duplicated_prop? = mod && (!Keyword.get(type_opts, :accumulate, false) and duplicated_attr?)
     duplicated_html_attr? = !mod && duplicated_attr?
-    root_prop? = Keyword.get(type_opts, :root, false)
 
-    cond do
-      duplicated_prop? && root_prop? ->
-        message = """
-        the prop `#{name}` has been passed multiple times. Considering only the last value.
+    if duplicated_html_attr? do
+      message = """
+      the attribute `#{name}` has been passed multiple times on line #{meta.line}. \
+      Considering only the last value.
 
-        Hint: Either specify the `#{name}` via the root property (`<#{meta.node_alias} { ... }>`) or \
-        explicitly via the #{name} property (`<#{meta.node_alias} #{name}="...">`), but not both.
-        """
+      Hint: remove all redundant definitions
+      """
 
-        IOHelper.warn(message, meta.caller, attr_meta.file, attr_meta.line)
-
-      duplicated_prop? && not root_prop? ->
-        message = """
-        the prop `#{name}` has been passed multiple times. Considering only the last value.
-
-        Hint: Either remove all redundant definitions or set option `accumulate` to `true`:
-
-        ```
-          prop #{name}, :#{type}, accumulate: true
-        ```
-
-        This way the values will be accumulated in a list.
-        """
-
-        IOHelper.warn(message, meta.caller, attr_meta.file, attr_meta.line)
-
-      duplicated_html_attr? ->
-        message = """
-        the attribute `#{name}` has been passed multiple times on line #{meta.line}. \
-        Considering only the last value.
-
-        Hint: remove all redundant definitions
-        """
-
-        IOHelper.warn(message, meta.caller, attr_meta.file, attr_meta.line)
-
-      true ->
-        nil
+      IOHelper.warn(message, meta.caller, attr_meta.file, attr_meta.line)
     end
 
     node = %AST.Attribute{
@@ -863,55 +1096,56 @@ defmodule Surface.Compiler do
 
   defp validate_tag_children([]), do: :ok
 
-  defp validate_tag_children([%AST.Template{name: name} | _]) do
-    {:error, "templates are only allowed as children elements of components, but found template for #{name}"}
+  defp validate_tag_children([%AST.SlotEntry{name: name, meta: meta} | _]) do
+    {:error, "slot entries are not allowed as children of HTML elements. Did you mean <##{name} />?", meta}
   end
 
   defp validate_tag_children([_ | nodes]), do: validate_tag_children(nodes)
 
   # This is a little bit hacky. :let will only be extracted for the default
-  # template if `mod` doesn't export __slot_name__ (i.e. if it isn't a slotable component)
+  # slot entry if `mod` doesn't export __slot_name__ (i.e. if it isn't a slotable component)
   # we pass in and modify the attributes so that non-slotable components are not
   # processed by the :let directive
-  defp collect_templates(mod, attributes, nodes, meta) do
-    # Don't extract the template directives if this module is slotable
+  defp collect_slot_entries(mod, attributes, nodes, meta) do
+    # Don't extract the slot entry directives if this module is slotable
     {:ok, directives, attributes} =
       if component_slotable?(mod) do
         {:ok, [], attributes}
       else
-        collect_directives(@template_directive_handlers, attributes, meta)
+        collect_directives(@slot_entry_directive_handlers, attributes, meta)
       end
 
-    templates =
+    slot_entries =
       nodes
       |> to_ast(meta)
       |> Enum.group_by(fn
-        %AST.Template{name: name} -> name
+        %AST.SlotEntry{name: name} -> name
         %AST.SlotableComponent{slot: name} -> name
         _ -> :default
       end)
 
     {already_wrapped, default_children} =
-      templates
+      slot_entries
       |> Map.get(:default, [])
       |> Enum.split_with(fn
-        %AST.Template{} -> true
+        %AST.SlotEntry{} -> true
         _ -> false
       end)
 
     if Enum.all?(default_children, &Helpers.is_blank_or_empty/1) do
-      {:ok, Map.put(templates, :default, already_wrapped), attributes}
+      {:ok, Map.put(slot_entries, :default, already_wrapped), attributes}
     else
       wrapped =
-        process_directives(%AST.Template{
+        process_directives(%AST.SlotEntry{
           name: :default,
           children: default_children,
+          props: [],
           directives: directives,
-          let: [],
+          let: nil,
           meta: meta
         })
 
-      {:ok, Map.put(templates, :default, [wrapped | already_wrapped]), attributes}
+      {:ok, Map.put(slot_entries, :default, [wrapped | already_wrapped]), attributes}
     end
   end
 
@@ -977,111 +1211,58 @@ defmodule Surface.Compiler do
     attr
   end
 
-  defp validate_properties(module, props, directives, meta) do
-    has_directive_props? = Enum.any?(directives, &match?(%AST.Directive{name: :props}, &1))
-
-    if not has_directive_props? and function_exported?(module, :__props__, 0) do
+  defp validate_properties(module, props) do
+    if function_exported?(module, :__props__, 0) do
       existing_props_names = Enum.map(props, & &1.name)
       required_props_names = module.__required_props_names__()
       missing_props_names = required_props_names -- existing_props_names
 
-      for prop_name <- missing_props_names do
-        message = "Missing required property \"#{prop_name}\" for component <#{meta.node_alias}>"
-
-        message =
-          if prop_name == :id and is_stateful_component(module) do
-            message <>
-              """
-              \n\nHint: Components using `Surface.LiveComponent` automatically define a required `id` prop to make them stateful.
-              If you meant to create a stateless component, you can switch to `use Surface.Component`.
-              """
-          else
-            message
-          end
-
-        IOHelper.warn(message, meta.caller, meta.file, meta.line)
+      if Enum.any?(missing_props_names) do
+        :missing_required_props
+      else
+        :ok
       end
     end
+  end
 
+  defp validate_slot_entries(Surface.Components.Dynamic.Component, _slot_entries, _meta) do
     :ok
   end
 
-  defp validate_templates(Surface.Components.Dynamic.Component, _templates, _meta) do
+  defp validate_slot_entries(Surface.Components.Dynamic.LiveComponent, _slot_entries, _meta) do
     :ok
   end
 
-  defp validate_templates(Surface.Components.Dynamic.LiveComponent, _templates, _meta) do
-    :ok
-  end
-
-  defp validate_templates(mod, templates, meta) do
-    names = Map.keys(templates)
+  defp validate_slot_entries(mod, slot_entries, meta) do
+    names = Map.keys(slot_entries)
 
     if !function_exported?(mod, :__slots__, 0) and not Enum.empty?(names) do
       message = """
       parent component `#{inspect(mod)}` does not define any slots. \
-      Found the following templates: #{inspect(names)}
+      Found the following slot entries: #{inspect(names)}
       """
 
       IOHelper.compile_error(message, meta.file, meta.line)
     end
 
     for name <- mod.__required_slots_names__(),
-        !Map.has_key?(templates, name) or
-          Enum.all?(Map.get(templates, name, []), &Helpers.is_blank_or_empty/1) do
+        !Map.has_key?(slot_entries, name) or
+          Enum.all?(Map.get(slot_entries, name, []), &Helpers.is_blank_or_empty/1) do
       message = "missing required slot \"#{name}\" for component <#{meta.node_alias}>"
-      IOHelper.warn(message, meta.caller, meta.file, meta.line)
+      IOHelper.warn(message, meta.caller, meta.file, {meta.line, meta.column})
     end
 
-    for {slot_name, template_instances} <- templates,
+    for {slot_name, slot_entry_instances} <- slot_entries,
         mod.__get_slot__(slot_name) == nil,
         not component_slotable?(mod),
-        template <- template_instances do
-      raise_missing_parent_slot_error!(mod, slot_name, template.meta, meta)
-    end
-
-    for slot_name <- Map.keys(templates),
-        template <- Map.get(templates, slot_name) do
-      slot = mod.__get_slot__(slot_name)
-      args = Keyword.keys(template.let)
-
-      arg_meta =
-        Enum.find_value(template.directives, meta, fn directive ->
-          if directive.module == Surface.Directive.Let do
-            directive.meta
-          end
-        end)
-
-      case slot do
-        %{opts: opts} ->
-          non_generator_args = Enum.map(opts[:args] || [], &Map.get(&1, :name))
-
-          undefined_keys = args -- non_generator_args
-
-          if not Enum.empty?(undefined_keys) do
-            [arg | _] = undefined_keys
-
-            message = """
-            undefined argument `#{inspect(arg)}` for slot `#{slot_name}` in `#{inspect(mod)}`.
-
-            Available arguments: #{inspect(non_generator_args)}.
-
-            Hint: You can define a new slot argument using the `args` option: \
-            `slot #{slot_name}, args: [..., #{inspect(arg)}]`
-            """
-
-            IOHelper.compile_error(message, arg_meta.file, arg_meta.line)
-          end
-
-        _ ->
-          :ok
-      end
+        slot_entry <- slot_entry_instances do
+      raise_missing_parent_slot_error!(mod, slot_name, slot_entry.meta, meta)
     end
 
     :ok
   end
 
-  defp raise_missing_slot_error!(module, slot_name, meta, _defined_slots, true = _short_syntax?) do
+  defp raise_missing_slot_error!(module, slot_name, meta, _defined_slots, true = _default_syntax?) do
     message = """
     no slot `#{slot_name}` defined in the component `#{inspect(module)}`
 
@@ -1091,7 +1272,7 @@ defmodule Surface.Compiler do
     IOHelper.compile_error(message, meta.file, meta.line)
   end
 
-  defp raise_missing_slot_error!(module, slot_name, meta, defined_slots, false = _short_syntax?) do
+  defp raise_missing_slot_error!(module, slot_name, meta, defined_slots, false = _default_syntax?) do
     defined_slot_names = Enum.map(defined_slots, & &1.name)
     similar_slot_message = similar_slot_message(slot_name, defined_slot_names)
     existing_slots_message = existing_slots_message(defined_slot_names)
@@ -1109,7 +1290,7 @@ defmodule Surface.Compiler do
     IOHelper.compile_error(message, meta.file, meta.line)
   end
 
-  defp raise_missing_parent_slot_error!(mod, slot_name, template_meta, parent_meta) do
+  defp raise_missing_parent_slot_error!(mod, slot_name, slot_entry_meta, parent_meta) do
     parent_slots = mod.__slots__() |> Enum.map(& &1.name)
 
     similar_slot_message = similar_slot_message(slot_name, parent_slots)
@@ -1117,9 +1298,9 @@ defmodule Surface.Compiler do
     existing_slots_message = existing_slots_message(parent_slots)
 
     header_message =
-      if component_slotable?(template_meta.module) do
+      if component_slotable?(slot_entry_meta.module) do
         """
-        The slotable component <#{inspect(template_meta.module)}> has the `:slot` option set to \
+        The slotable component <#{inspect(slot_entry_meta.module)}> has the `:slot` option set to \
         `#{slot_name}`.
 
         That slot name is not declared in parent component <#{parent_meta.node_alias}>.
@@ -1138,7 +1319,7 @@ defmodule Surface.Compiler do
     #{existing_slots_message}
     """
 
-    IOHelper.compile_error(message, template_meta.file, template_meta.line)
+    IOHelper.compile_error(message, slot_entry_meta.file, slot_entry_meta.line)
   end
 
   defp raise_complex_generator(meta) do
@@ -1179,9 +1360,9 @@ defmodule Surface.Compiler do
 
   defp maybe_warn_required_slot_with_default_value(_, [], _, _), do: nil
 
-  defp maybe_warn_required_slot_with_default_value(slot, _, short_syntax?, meta) do
+  defp maybe_warn_required_slot_with_default_value(slot, _, for_ast, meta) do
     if Keyword.get(slot.opts, :required, false) do
-      slot_name_tag = if short_syntax?, do: "", else: " name=\"#{slot.name}\""
+      slot_for_tag = if for_ast == nil, do: "", else: " {#{for_ast.original}}"
 
       message = """
       setting the fallback content on a required slot has no effect.
@@ -1190,18 +1371,46 @@ defmodule Surface.Compiler do
 
         slot #{slot.name}
         ...
-        <#slot#{slot_name_tag}>Fallback content</#slot>
+        <#slot#{slot_for_tag}>Fallback content</#slot>
 
       or keep the slot as required and remove the fallback content:
 
         slot #{slot.name}, required: true`
         ...
-        <#slot#{slot_name_tag} />
+        <#slot#{slot_for_tag} />
 
       but not both.
       """
 
       IOHelper.warn(message, meta.caller, meta.file, meta.line)
+    end
+  end
+
+  defp maybe_warn_argument_for_default_slot_in_slotable_component(slot, arg, meta) do
+    if arg && arg.value do
+      slot_name = Module.get_attribute(meta.caller.module, :__slot_name__)
+      default_slot_of_slotable_component? = slot.name == :default && slot_name
+
+      if default_slot_of_slotable_component? do
+        component_name = Macro.to_string(meta.caller.module)
+
+        message = """
+        arguments for the default slot in a slotable component are not accessible - instead the arguments \
+        from the parent's #{slot_name} slot will be exposed via `:let={...}`.
+
+        Hint: You can remove these arguments, pull them up to the parent component, or make this component not slotable \
+        and use it inside an explicit slot entry:
+        ```
+        <:#{slot_name}>
+          <#{component_name} :let={...}>
+            ...
+          </#{component_name}>
+        </:#{slot_name}>
+        ```
+        """
+
+        IOHelper.warn(message, meta.caller, meta.line)
+      end
     end
   end
 
@@ -1275,15 +1484,15 @@ defmodule Surface.Compiler do
     end
   end
 
-  defp validate_slot_attrs!(attrs) do
-    Enum.each(attrs, &validate_slot_attr!/1)
+  defp validate_slot_attrs!(attrs, caller) do
+    Enum.each(attrs, &validate_slot_attr!(&1, caller))
   end
 
-  defp validate_slot_attr!({name, _, _meta}) when name in @valid_slot_props do
+  defp validate_slot_attr!({name, _, _meta}, _caller) when name in @valid_slot_props do
     :ok
   end
 
-  defp validate_slot_attr!({name, _, %{file: file, line: line}}) do
+  defp validate_slot_attr!({name, _, %{file: file, line: line}}, _caller) do
     type =
       case name do
         ":" <> _ -> "directive"
@@ -1293,7 +1502,7 @@ defmodule Surface.Compiler do
     message = """
     invalid #{type} `#{name}` for <#slot>.
 
-    Slots only accept `name`, `index`, `:args`, `:if` and `:for`.
+    Slots only accept the root prop, `generator_value`, `:if` and `:for`.
     """
 
     IOHelper.compile_error(message, file, line)
@@ -1302,13 +1511,337 @@ defmodule Surface.Compiler do
   defp handle_convert_node_to_ast_error(name, error, meta) do
     case error do
       {:error, message, details} ->
-        {:error, {"cannot render <#{name}> (#{message})", details, meta.line}, meta}
+        {:error, {"cannot render <#{name}> (#{message})", details, meta.line, meta.column}, meta}
 
       {:error, message} ->
-        {:error, {"cannot render <#{name}> (#{message})", meta.line}, meta}
+        {:error, {"cannot render <#{name}> (#{message})", meta.line, meta.column}, meta}
 
       _ ->
-        {:error, {"cannot render <#{name}>", meta.line}, meta}
+        {:error, {"cannot render <#{name}>", meta.line, meta.column}, meta}
+    end
+  end
+
+  defp maybe_transform_ast(nodes, %CompileMeta{style: style, caller: caller, caller_spec: caller_spec}) do
+    Enum.map(nodes, fn node ->
+      node
+      |> maybe_add_s_scope_to_root_node(caller_spec)
+      |> maybe_add_s_self_to_root_node(caller_spec)
+      |> maybe_add_vars_to_style_attr_on_root(style, caller.function)
+      |> maybe_add_caller_scope_id_attr_to_root_node(caller_spec)
+      |> maybe_add_data_variants_to_root_node(caller_spec)
+    end)
+  end
+
+  defp maybe_transform_ast(nodes, _compile_meta) do
+    nodes
+  end
+
+  defp maybe_add_s_self_to_root_node(%AST.Tag{} = node, %CallerSpec{requires_s_self_on_root?: true}) do
+    %AST.Tag{attributes: attributes, meta: meta} = node
+
+    data_self_attr = %AST.Attribute{
+      meta: meta,
+      name: :"#{CSSTranslator.self_attr()}",
+      type: :string,
+      value: %AST.Literal{value: true}
+    }
+
+    %AST.Tag{node | attributes: [data_self_attr | attributes]}
+  end
+
+  defp maybe_add_s_self_to_root_node(node, _caller_spec) do
+    node
+  end
+
+  defp maybe_add_s_scope_to_root_node(
+         %AST.Tag{} = node,
+         %CallerSpec{requires_s_scope_on_root?: true} = caller_spec
+       ) do
+    %AST.Tag{attributes: attributes, meta: meta} = node
+
+    data_s_scope = :"#{CSSTranslator.scope_attr_prefix()}#{caller_spec.scope_id}"
+
+    attributes =
+      if not AST.has_attribute?(attributes, data_s_scope) do
+        data_scope_attr = %AST.Attribute{
+          meta: meta,
+          name: data_s_scope,
+          type: :string,
+          value: %AST.Literal{value: true}
+        }
+
+        [data_scope_attr | attributes]
+      else
+        attributes
+      end
+
+    %AST.Tag{node | attributes: attributes}
+  end
+
+  defp maybe_add_s_scope_to_root_node(node, _caller_spec) do
+    node
+  end
+
+  defp maybe_add_vars_to_style_attr_on_root(%AST.Tag{} = node, %{vars: vars, inline?: inline?} = style, func)
+       when vars != %{} and (func == {:render, 1} or inline?) do
+    %AST.Tag{attributes: attributes, meta: meta} = node
+    %{file: file} = style
+
+    vars_ast =
+      for {var, {expr, %{line: line, column: column}}} <- vars do
+        # +1 for the parenthesis, +1 for the quote
+        col = column + 2
+        {String.to_atom(var), Code.string_to_quoted!(expr, line: line, column: col, file: file)}
+      end
+
+    updated_attrs =
+      case AST.pop_attributes_as_map(attributes, [:style]) do
+        {%{style: nil}, rest} ->
+          attr = %AST.Attribute{
+            meta: meta,
+            name: :style,
+            type: :style,
+            value: %AST.AttributeExpr{
+              meta: meta,
+              value: vars_ast
+            }
+          }
+
+          [attr | rest]
+
+        {%{style: %AST.Attribute{value: value} = style}, rest} ->
+          style_expr = merge_vars_into_style(value, vars_ast, meta)
+          [%AST.Attribute{style | value: style_expr} | rest]
+      end
+
+    %AST.Tag{node | attributes: updated_attrs}
+  end
+
+  defp maybe_add_vars_to_style_attr_on_root(node, _style, _func) do
+    node
+  end
+
+  defp maybe_add_data_variants_to_root_node(%AST.Tag{} = node, caller_spec) do
+    %AST.Tag{attributes: attributes, meta: meta} = node
+    %CallerSpec{data_variants: data_variants} = caller_spec
+
+    variants_attributes =
+      for {type, _func, _name, data_name, assign_ast, _variants} <- data_variants do
+        expr_ast =
+          case type do
+            :boolean ->
+              quote do
+                unquote(assign_ast) == true
+              end
+
+            :enum ->
+              quote do
+                unquote(assign_ast) != nil and not Enum.empty?(unquote(assign_ast))
+              end
+
+            :choice ->
+              quote do
+                unquote(assign_ast)
+              end
+
+            :other ->
+              quote do
+                unquote(assign_ast) != nil
+              end
+          end
+
+        %AST.Attribute{
+          meta: meta,
+          name: "data-#{data_name}",
+          type: :string,
+          value: %AST.AttributeExpr{
+            meta: meta,
+            value: expr_ast
+          }
+        }
+      end
+
+    %AST.Tag{node | attributes: variants_attributes ++ attributes}
+  end
+
+  defp maybe_add_data_variants_to_root_node(node, _style) do
+    node
+  end
+
+  defp merge_vars_into_style(%AST.AttributeExpr{value: attr_expr_value} = attr_expr, vars_ast, _meta) do
+    {p1, p2, [p3, p4, p5, value, p6, p7, p8]} = attr_expr_value
+
+    %AST.AttributeExpr{attr_expr | constant?: false, value: {p1, p2, [p3, p4, p5, value ++ vars_ast, p6, p7, p8]}}
+  end
+
+  defp merge_vars_into_style(%AST.Literal{value: value}, vars_ast, meta) do
+    {:ok, kw_list} = Surface.TypeHandler.Style.expr_to_value([value], [], nil)
+
+    %AST.AttributeExpr{
+      meta: meta,
+      original: value,
+      value: kw_list ++ vars_ast
+    }
+  end
+
+  defp maybe_transform_tag(node, %mod{
+         style: style,
+         caller_spec: %CallerSpec{has_style_or_variants?: true} = caller_spec
+       })
+       when mod in [CompileMeta, AST.Meta] do
+    %{element: element, attributes: attributes, meta: meta} = node
+    %{selectors: selectors} = style
+    %CallerSpec{scope_id: scope_id, variants: variants} = caller_spec
+
+    if universal_in_selectors?(selectors) or
+         element_in_selectors?(element, selectors) or
+         maybe_in_selectors_or_using_variants?(element, attributes, selectors, variants) do
+      s_data_attr = %AST.Attribute{
+        meta: meta,
+        name: :"#{CSSTranslator.scope_attr_prefix()}#{scope_id}",
+        type: :string,
+        value: %AST.Literal{value: true}
+      }
+
+      %{node | attributes: [s_data_attr | attributes]}
+    else
+      node
+    end
+  end
+
+  defp maybe_transform_tag(node, _compile_meta) do
+    node
+  end
+
+  defp maybe_in_selectors_or_using_variants?(element, attributes, selectors, variants) do
+    {%{id: id, class: class}, _} = AST.pop_attributes_values_as_map(attributes, [:id, :class])
+
+    maybe_in_class_selectors_or_variants?(element, class, selectors, variants) or
+      maybe_in_id_selectors?(element, id, selectors) or
+      maybe_in_combined_selectors?(element, id, class, selectors)
+  end
+
+  defp maybe_in_class_selectors_or_variants?(element, class, %{classes: classes, combined: combined}, variants) do
+    case class do
+      %AST.Literal{value: value} ->
+        value
+        |> String.split()
+        |> Enum.any?(fn c ->
+          MapSet.member?(classes, c) or
+            MapSet.member?(combined, MapSet.new([element, ".#{c}"])) or
+            String.contains?(c, variants)
+        end)
+
+      nil ->
+        false
+
+      _ ->
+        true
+    end
+  end
+
+  defp maybe_in_combined_selectors?(_, %AST.AttributeExpr{} = _id, _, _) do
+    true
+  end
+
+  defp maybe_in_combined_selectors?(_, _, %AST.AttributeExpr{} = _class, _) do
+    true
+  end
+
+  defp maybe_in_combined_selectors?(element, id, class, %{combined: combined}) do
+    sels =
+      case class do
+        %AST.Literal{value: value} -> value |> String.split() |> Enum.map(&".#{&1}")
+        _ -> []
+      end
+
+    sels =
+      case id do
+        %AST.Literal{value: value} -> [value | sels]
+        _ -> sels
+      end
+
+    sels_set = MapSet.new([element | sels])
+
+    Enum.any?(combined, &MapSet.subset?(&1, sels_set))
+  end
+
+  defp maybe_in_id_selectors?(element, id, %{ids: ids, combined: combined}) do
+    case id do
+      %AST.Literal{value: value} ->
+        MapSet.member?(ids, value) or MapSet.member?(combined, MapSet.new([element, "##{value}"]))
+
+      nil ->
+        false
+
+      _ ->
+        true
+    end
+  end
+
+  defp element_in_selectors?(element, %{elements: elements}) do
+    MapSet.member?(elements, element)
+  end
+
+  defp universal_in_selectors?(%{other: other}) do
+    MapSet.member?(other, "*")
+  end
+
+  defp maybe_pop_style([{"style", _attrs, content, %{line: line}} | tokens], %{function: fun} = caller, opts)
+       when fun != nil do
+    style =
+      content
+      |> to_string()
+      |> CSSTranslator.translate!(
+        line: line,
+        file: opts[:file],
+        inline?: true,
+        scope: {caller.module, elem(caller.function, 0)}
+      )
+
+    if not Module.has_attribute?(caller.module, :__style__) do
+      Module.register_attribute(caller.module, :__style__, accumulate: true)
+    end
+
+    Module.put_attribute(caller.module, :__style__, {elem(caller.function, 0), style})
+
+    {style, tokens}
+  end
+
+  defp maybe_pop_style(tokens, caller, _opts) do
+    style =
+      if Module.open?(caller.module) && caller.function do
+        caller.module
+        |> Helpers.get_module_attribute(:__style__, [])
+        |> Keyword.get(:__module__)
+      end
+
+    # TODO: Create a struct to hold and inicialize the selectors or even the style itself
+    style =
+      style ||
+        %{
+          scope_id: Surface.Compiler.CSSTranslator.scope_id(caller.module),
+          selectors: %{
+            elements: MapSet.new(),
+            classes: MapSet.new(),
+            ids: MapSet.new(),
+            combined: MapSet.new(),
+            other: MapSet.new()
+          }
+        }
+
+    {style, tokens}
+  end
+
+  defp skip_blanks([]) do
+    []
+  end
+
+  defp skip_blanks([token | rest] = tokens) do
+    if Helpers.blank?(token) do
+      skip_blanks(rest)
+    else
+      tokens
     end
   end
 end

@@ -3,8 +3,11 @@ defmodule Surface.ContextChangeTrackingTest do
 
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
+  import Surface.LiveViewTest
 
   @endpoint Endpoint
+
+  register_propagate_context_to_slots([__MODULE__.ContextSetter])
 
   defmodule ContextSetter do
     use Surface.Component
@@ -29,13 +32,15 @@ defmodule Surface.ContextChangeTrackingTest do
 
     slot default
 
+    data field, :any
+
     def render(assigns) do
+      assigns = Context.copy_assign(assigns, :field)
+
       ~F"""
-      <Context get={field: field}>
-        <CheckUpdated id="1" dest={@test_pid} content={field}/>
-        <CheckUpdated id="2" dest={@test_pid}/>
-        <div><#slot/></div>
-      </Context>
+      <CheckUpdated id="1" dest={@test_pid} content={@field}/>
+      <CheckUpdated id="2" dest={@test_pid}/>
+      <div><#slot/></div>
       """
     end
   end
@@ -85,12 +90,15 @@ defmodule Surface.ContextChangeTrackingTest do
     assert html =~ "Count: 1"
     assert html =~ "field value"
 
-    # Component using context assings should be updated
+    # Component using context assigns should be updated
     assert_receive {:updated, "1"}
 
-    # TODO: Components not using the context assigns should not be updated
-    # refute_receive {:updated, "2"}
-    refute_receive {:updated, "3"}
-    refute_receive {:updated, "4"}
+    # NOTE: Due to a limitation in LV's change tracking,
+    # the following updates are received. If they fail it probably
+    # means LiveView was fixed/optimized and we can change them to refute_receive.
+    # See test/surface/integrations/lv_change_tracking_test.exs
+    assert_receive {:updated, "2"}
+    assert_receive {:updated, "3"}
+    assert_receive {:updated, "4"}
   end
 end
