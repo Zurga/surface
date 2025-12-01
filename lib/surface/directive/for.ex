@@ -1,6 +1,31 @@
 defmodule Surface.Directive.For do
   use Surface.Directive
 
+  defmodule Key do
+    use Surface.Directive
+
+    def extract({":key", {:attribute_expr, value, expr_meta}, attr_meta}, meta) do
+      %AST.Directive{
+        module: __MODULE__,
+        name: :key,
+        value: directive_value(value, Helpers.to_meta(expr_meta, meta)),
+        meta: Helpers.to_meta(attr_meta, meta)
+      }
+    end
+
+    def extract(_, _), do: []
+
+    def process(_, node), do: node
+
+    defp directive_value(value, meta) do
+      AST.AttributeExpr.new(
+        Surface.TypeHandler.expr_to_quoted!(value, ":key", :key_arg, meta) |> IO.inspect(label: :directive_value),
+        value,
+        meta
+      )
+    end
+  end
+
   def extract({":for", {:attribute_expr, value, expr_meta}, attr_meta}, meta) do
     %AST.Directive{
       module: __MODULE__,

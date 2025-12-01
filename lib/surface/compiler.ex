@@ -19,6 +19,7 @@ defmodule Surface.Compiler do
     Surface.Directive.Values,
     Surface.Directive.If,
     Surface.Directive.For,
+    Surface.Directive.For.Key,
     Surface.Directive.Debug
   ]
 

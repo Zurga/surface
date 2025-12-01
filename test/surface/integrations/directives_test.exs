@@ -592,6 +592,27 @@ defmodule Surface.DirectivesTest do
              </div>
              """
     end
+
+    test "with :key directive" do
+      assigns = %{keyed_items: [1, 2]}
+
+      html =
+        render_surface do
+          ~F"""
+          <div :for={i <- @keyed_items} :key={i}>
+            Item: {i}
+          </div>
+          """
+        end
+
+      assert html =~ """
+             <div>
+               Item: 1
+             </div><div>
+               Item: 2
+             </div>
+             """
+    end
   end
 
   describe ":if" do
