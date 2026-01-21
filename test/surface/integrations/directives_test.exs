@@ -578,7 +578,7 @@ defmodule Surface.DirectivesTest do
       html =
         render_surface do
           ~F"""
-          <div :for.index={@items}>
+          <div :for.index={index <- @items}>
             Index: {index}
           </div>
           """

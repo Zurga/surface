@@ -116,7 +116,7 @@ defmodule Surface.Components.LinkTest do
   test "updates when opts change", %{conn: conn} do
     {:ok, view, html} = live_isolated(conn, ViewWithLink)
     refute html =~ ~s(disabled="disabled")
-    assert render_click(view, :toggle_disable) =~ ~s(disabled="disabled")
+    assert render_click(view, :toggle_disable) =~ ~s(disabled="")
     refute render_click(view, :toggle_disable) =~ ~s(disabled="disabled")
   end
 

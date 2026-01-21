@@ -43,12 +43,13 @@ defmodule Surface.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:phoenix_live_view, "~> 0.19.0 or ~> 0.20.10 or ~> 1.0"},
+      {:phoenix_live_view, "~> 0.19.0 or ~> 0.20.10 or ~> 1.1"},
       {:sourceror, "~> 1.0"},
       {:blend, "~> 0.3.0", only: :dev},
       {:jason, "~> 1.0", only: :test},
       {:floki, "~> 0.35", only: :test},
-      {:ex_doc, ">= 0.31.0", only: :docs}
+      {:ex_doc, ">= 0.31.0", only: :docs},
+      {:lazy_html, ">= 0.1.0", only: :test}
     ]
   end
 
